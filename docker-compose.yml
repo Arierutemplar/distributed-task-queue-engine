@@ -1,0 +1,58 @@
+# Local engine: one process serves HTTP and runs the BullMQ worker.
+# REDIS_URL inside the app container is the in-network Redis, not a value from .env.
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - queue-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PORT: "3000"
+      REDIS_URL: redis://redis:6379
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SERVICE_NAME: ${SERVICE_NAME:-distributed-task-queue}
+    ports:
+      - "${PORT:-3000}:3000"
+    networks:
+      - queue-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const net=require('net'); const socket=net.connect(3000,'127.0.0.1',()=>{socket.end();process.exit(0)}); socket.setTimeout(2000,()=>process.exit(1)); socket.on('error',()=>process.exit(1));"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    init: true
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+networks:
+  queue-net:
+    driver: bridge
+
+volumes:
+  redis_data:
