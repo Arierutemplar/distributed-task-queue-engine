@@ -1,0 +1,125 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint, typecheck, unit tests + coverage, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - name: Unit tests with coverage thresholds
+        run: npm run test:coverage
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 14
+      - run: npm run build
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  integration:
+    name: Integration tests (real Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      TEST_REDIS_URL: redis://127.0.0.1:6380
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:integration
+
+  image:
+    name: Docker Compose smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [quality, integration]
+    env:
+      # Throwaway values for the ephemeral CI stack only.
+      REDIS_PASSWORD: ci-redis-password-not-a-secret
+      CI_API_KEY: ci-api-key-not-a-secret-0123456789abcdef
+      API_KEYS: ci-tenant:ci-api-key-not-a-secret-0123456789abcdef
+      ADMIN_USERNAME: ci-admin
+      ADMIN_PASSWORD: ci-admin-password-not-a-secret
+      BILLING_FAILURE_RATE: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start the stack with a dedicated worker
+        run: docker compose --profile scale-out up --build -d --wait --scale worker=2
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          base=http://localhost:3000
+          status() { curl --silent -o /dev/null -w '%{http_code}' "$@"; }
+
+          curl --fail --silent "$base/health/live"
+          curl --fail --silent "$base/health/ready"
+          curl --fail --silent "$base/metrics" | grep -q '^queue_jobs'
+
+          test "$(status -X POST "$base/api/v1/tasks/process" -H 'Content-Type: application/json' -d '{}')" = 401
+          test "$(status -X POST "$base/api/v1/tasks/process" -H "X-API-Key: $CI_API_KEY" \
+            -H 'Content-Type: application/json' -d '{"type":"NOPE"}')" = 400
+
+          task_id=$(curl --fail --silent -X POST "$base/api/v1/tasks/process" \
+            -H 'Content-Type: application/json' -H "X-API-Key: $CI_API_KEY" -H 'Idempotency-Key: ci-smoke-1' \
+            -d '{"type":"PROCESS_DOCUMENT","documentId":"ci","content":"smoke test"}' | jq -r .taskId)
+          for _ in $(seq 1 30); do
+            state=$(curl --fail --silent "$base/api/v1/tasks/$task_id" -H "X-API-Key: $CI_API_KEY" | jq -r .state)
+            [ "$state" = completed ] && break
+            sleep 1
+          done
+          test "$state" = completed
+
+          test "$(status "$base/admin/queues")" = 401
+          test "$(status -u "$ADMIN_USERNAME:$ADMIN_PASSWORD" "$base/admin/api/dead-letter")" = 200
+          curl --fail --silent -u "$ADMIN_USERNAME:$ADMIN_PASSWORD" "$base/admin/api/audit?limit=5" \
+            | jq -e '.items | map(.action) | index("dead_letter.list") != null'
+      - name: Graceful shutdown
+        run: |
+          docker compose --profile scale-out stop --timeout 30
+          docker compose --profile scale-out ps --all --format '{{.Service}} {{.ExitCode}}' | tee /dev/stderr \
+            | awk '$1 != "redis" && $2 != 0 { bad = 1 } END { exit bad }'
+      - name: Compose logs
+        if: always()
+        run: docker compose --profile scale-out logs --no-color
+      - name: Tear down
+        if: always()
+        run: docker compose --profile scale-out down -v

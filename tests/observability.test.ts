@@ -1,0 +1,189 @@
+import { Writable } from 'node:stream';
+import { context, propagation, trace } from '@opentelemetry/api';
+import { W3CTraceContextPropagator } from '@opentelemetry/core';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
+import {
+  BasicTracerProvider,
+  InMemorySpanExporter,
+  SimpleSpanProcessor,
+} from '@opentelemetry/sdk-trace-base';
+import pino from 'pino';
+import request from 'supertest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({ add: vi.fn() }));
+
+vi.mock('../src/config/redis.js', () => ({ redis: {}, pingRedis: vi.fn() }));
+vi.mock('../src/queues/task.queue.js', () => ({
+  TASK_QUEUE_NAME: 'tasks',
+  TASK_MAX_ATTEMPTS: 5,
+  taskQueue: {
+    name: 'tasks',
+    add: mocks.add,
+    getJob: vi.fn(),
+    getJobCounts: vi.fn(async () => ({})),
+  },
+}));
+vi.mock('../src/queues/dead-letter.queue.js', () => ({
+  deadLetterJobId: (id: string) => `dlq-${id}`,
+  deadLetterQueue: {
+    name: 'tasks-dead-letter',
+    getJob: vi.fn(),
+    getJobCounts: vi.fn(async () => ({})),
+  },
+}));
+vi.mock('../src/routes/board.routes.js', async () => {
+  const { Router } = await import('express');
+  return { boardRouter: Router() };
+});
+
+import { createApp } from '../src/app.js';
+import { loadConfig } from '../src/config/env.js';
+import { createAuditLog } from '../src/observability/audit.js';
+import { withJobSpan } from '../src/observability/tracing.js';
+import type { TaskJobMeta } from '../src/types/task.types.js';
+
+describe('distributed tracing', () => {
+  const exporter = new InMemorySpanExporter();
+  const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+  const contextManager = new AsyncLocalStorageContextManager();
+
+  beforeAll(() => {
+    context.setGlobalContextManager(contextManager.enable());
+    propagation.setGlobalPropagator(new W3CTraceContextPropagator());
+    trace.setGlobalTracerProvider(provider);
+  });
+
+  afterAll(async () => {
+    await provider.shutdown();
+    trace.disable();
+    propagation.disable();
+    context.disable();
+  });
+
+  it('continues the inbound trace through the job meta into the worker span', async () => {
+    mocks.add.mockResolvedValue({ id: 'job-1' });
+    const app = await createApp({ config: loadConfig({ NODE_ENV: 'test', LOG_LEVEL: 'silent' }) });
+    const traceId = '4bf92f3577b34da6a3ce929d0e0e4736';
+
+    const response = await request(app)
+      .post('/api/v1/tasks/process')
+      .set('traceparent', `00-${traceId}-00f067aa0ba902b7-01`)
+      .send({ type: 'PROCESS_DOCUMENT', documentId: 'd-1', content: 'traced' });
+    expect(response.status).toBe(202);
+
+    const meta = (mocks.add.mock.calls[0]?.[1] as { meta: TaskJobMeta }).meta;
+    expect(meta.traceparent).toMatch(new RegExp(`^00-${traceId}-[0-9a-f]{16}-01$`, 'u'));
+
+    await withJobSpan(
+      'process PROCESS_DOCUMENT',
+      meta,
+      { 'task.type': 'PROCESS_DOCUMENT' },
+      async () => 'ok',
+    );
+
+    const spans = exporter.getFinishedSpans();
+    const server = spans.find((span) => span.name === 'POST /api/v1/tasks/process');
+    const consumer = spans.find((span) => span.name === 'process PROCESS_DOCUMENT');
+    expect(server?.spanContext().traceId).toBe(traceId);
+    expect(server?.attributes['http.response.status_code']).toBe(202);
+    expect(consumer?.spanContext().traceId).toBe(traceId);
+    expect(consumer?.parentSpanContext?.spanId).toBe(server?.spanContext().spanId);
+  });
+});
+
+describe('audit log', () => {
+  it('emits one structured, secret-free line per record and skips persistence without Redis', async () => {
+    const lines: string[] = [];
+    const sink = new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        lines.push(chunk.toString());
+        callback();
+      },
+    });
+    const audit = createAuditLog({
+      logger: pino({ level: 'info' }, sink),
+      now: () => new Date('2026-01-01T00:00:00.000Z'),
+    });
+
+    await audit.record({
+      action: 'dead_letter.replay',
+      outcome: 'success',
+      actor: 'admin',
+      requestId: 'req-1',
+      method: 'POST',
+      path: '/admin/api/dead-letter/9/replay',
+      tenantId: 'acme',
+      taskId: '9',
+      newTaskId: '10',
+    });
+
+    expect(lines).toHaveLength(1);
+    const line = JSON.parse(lines[0] ?? '{}') as Record<string, unknown>;
+    expect(line).toMatchObject({
+      audit: true,
+      level: 30,
+      event: {
+        timestamp: '2026-01-01T00:00:00.000Z',
+        action: 'dead_letter.replay',
+        actor: 'admin',
+        requestId: 'req-1',
+        tenantId: 'acme',
+        taskId: '9',
+        newTaskId: '10',
+        outcome: 'success',
+      },
+    });
+    await expect(audit.list(10)).resolves.toEqual([]);
+  });
+
+  it('persists to a capped stream, lists newest first, and survives Redis errors', async () => {
+    const stored: [string, string[]][] = [];
+    const redis = {
+      xadd: vi.fn(async (...args: (string | number)[]) => {
+        stored.unshift([`${stored.length + 1}-0`, ['record', String(args.at(-1))]]);
+        return 'id';
+      }),
+      xrevrange: vi.fn(async () => [
+        ...stored,
+        ['0-0', ['record', '{not json']],
+        ['0-1', ['other', 'x']],
+      ]),
+    };
+    const logger = pino({ level: 'silent' });
+    const audit = createAuditLog({
+      logger,
+      redis: redis as never,
+      streamKey: 'svc:audit:admin',
+      maxEntries: 50,
+    });
+    const event = {
+      action: 'dead_letter.delete',
+      outcome: 'success',
+      actor: 'admin',
+      requestId: 'req-2',
+      method: 'DELETE',
+      path: '/admin/api/dead-letter/7',
+      taskId: '7',
+    } as const;
+
+    await audit.record(event);
+    expect(redis.xadd).toHaveBeenCalledWith(
+      'svc:audit:admin',
+      'MAXLEN',
+      '~',
+      50,
+      '*',
+      'record',
+      expect.any(String),
+    );
+    // Malformed or foreign entries are skipped instead of failing the endpoint.
+    await expect(audit.list(5)).resolves.toEqual([
+      expect.objectContaining({ ...event, id: '1-0' }),
+    ]);
+    expect(redis.xrevrange).toHaveBeenCalledWith('svc:audit:admin', '+', '-', 'COUNT', 5);
+
+    redis.xadd.mockRejectedValueOnce(new Error('READONLY'));
+    await expect(audit.record(event)).resolves.toBeUndefined();
+  });
+});

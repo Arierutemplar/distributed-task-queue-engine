@@ -1,0 +1,144 @@
+# One deployable, three roles. The default stack runs PROCESS_ROLE=all (HTTP + worker).
+# The containers connect to the in-network Redis with REDIS_PASSWORD; REDIS_URL from .env is never used.
+# REDIS_PASSWORD and API_KEYS are required: set them in .env (see .env.example).
+#
+#   docker compose up --build                         # redis + app
+#   docker compose --profile scale-out up --build     # + dedicated worker-only container
+#   docker compose --profile observability up --build # + Prometheus on :9090
+
+x-app-environment: &app-environment
+  REDIS_URL: ''
+  REDIS_HOST: redis
+  REDIS_PORT: '6379'
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env (see .env.example)}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+  JOB_TIMEOUT_MS: ${JOB_TIMEOUT_MS:-30000}
+  SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-25000}
+  BILLING_FAILURE_RATE: ${BILLING_FAILURE_RATE:-0.2}
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: ${CIRCUIT_BREAKER_FAILURE_THRESHOLD:-5}
+  CIRCUIT_BREAKER_RESET_TIMEOUT_MS: ${CIRCUIT_BREAKER_RESET_TIMEOUT_MS:-30000}
+  TASK_MAX_ATTEMPTS: ${TASK_MAX_ATTEMPTS:-5}
+  TASK_BACKOFF_DELAY_MS: ${TASK_BACKOFF_DELAY_MS:-2000}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  SERVICE_NAME: ${SERVICE_NAME:-distributed-task-queue}
+  METRICS_ENABLED: ${METRICS_ENABLED:-true}
+  TRUST_PROXY: ${TRUST_PROXY:-0}
+  # Optional tracing: off unless OTEL_ENABLED=true and a collector is reachable.
+  OTEL_ENABLED: ${OTEL_ENABLED:-false}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+
+x-app-healthcheck: &app-healthcheck
+  test:
+    - CMD
+    - node
+    - -e
+    - "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  interval: 5s
+  timeout: 5s
+  retries: 12
+  start_period: 10s
+
+services:
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env (see .env.example)}
+    # BullMQ requires noeviction: evicting a queue key silently loses jobs.
+    # requirepass is fed through stdin so the password never appears in the process list.
+    command:
+      - sh
+      - -c
+      - |
+        exec redis-server - --appendonly yes --maxmemory-policy noeviction <<EOF
+        requirepass $$REDIS_PASSWORD
+        EOF
+    # Loopback only: reachable from this machine for host development, never from the network.
+    ports:
+      - '127.0.0.1:${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis_data:/data
+    networks:
+      - queue-net
+    healthcheck:
+      # REDISCLI_AUTH keeps the password out of the command line.
+      test: ['CMD-SHELL', 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-task-queue:local
+    environment:
+      <<: *app-environment
+      PORT: '3000'
+      PROCESS_ROLE: all
+      API_KEYS: ${API_KEYS:?Set API_KEYS in .env (see .env.example)}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_AUTH_MAX_FAILURES: ${ADMIN_AUTH_MAX_FAILURES:-10}
+      ADMIN_AUTH_WINDOW_MS: ${ADMIN_AUTH_WINDOW_MS:-900000}
+      AUDIT_LOG_MAX_ENTRIES: ${AUDIT_LOG_MAX_ENTRIES:-10000}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-300}
+      RATE_LIMIT_TENANT_MAX: ${RATE_LIMIT_TENANT_MAX:-0}
+      RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-60000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    ports:
+      - '${PORT:-3000}:3000'
+    networks:
+      - queue-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck: *app-healthcheck
+    init: true
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  worker:
+    profiles: ['scale-out']
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-task-queue:local
+    environment:
+      <<: *app-environment
+      PORT: '3000'
+      PROCESS_ROLE: worker
+    networks:
+      - queue-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_started
+    healthcheck: *app-healthcheck
+    init: true
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  prometheus:
+    profiles: ['observability']
+    image: prom/prometheus:v2.54.1
+    command: ['--config.file=/etc/prometheus/prometheus.yml']
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - '${PROMETHEUS_PORT:-9090}:9090'
+    networks:
+      - queue-net
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  queue-net:
+    driver: bridge
+
+volumes:
+  redis_data:
