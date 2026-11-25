@@ -1,7 +1,7 @@
 import { Worker } from 'bullmq';
 import { config } from '../config/env.js';
 import { logger } from '../config/logger.js';
-import { redis } from '../config/redis.js';
+import { coordinationRedis, redis } from '../config/redis.js';
 import {
   tasksDeadLetteredTotal,
   taskDuration,
@@ -14,7 +14,7 @@ import {
   deadLetterQueue,
 } from '../queues/dead-letter.queue.js';
 import { TASK_QUEUE_NAME } from '../queues/task.queue.js';
-import { CircuitBreaker } from '../resilience/circuit-breaker.js';
+import { RedisCircuitBreaker } from '../resilience/redis-circuit-breaker.js';
 import { BillingMockService, type BillingGateway } from '../services/billing.mock.service.js';
 import type { TaskJobData, TaskResult, TaskType } from '../types/task.types.js';
 import { createTaskProcessor, type TaskJob } from './task.processor.js';
@@ -72,16 +72,20 @@ export interface TaskWorkerOptions {
 export const createTaskWorker = (
   options: TaskWorkerOptions = {},
 ): Worker<TaskJobData, TaskResult, TaskType> => {
-  setCircuitState(BILLING_CIRCUIT, 'closed');
-  const billingCircuit = new CircuitBreaker({
+  const billingCircuit = new RedisCircuitBreaker({
+    redis: coordinationRedis,
+    key: `${config.SERVICE_NAME}:circuit:billing`,
     name: BILLING_CIRCUIT,
     failureThreshold:
       options.circuitBreaker?.failureThreshold ?? config.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
     resetTimeoutMs:
       options.circuitBreaker?.resetTimeoutMs ?? config.CIRCUIT_BREAKER_RESET_TIMEOUT_MS,
+    probeLeaseMs: config.JOB_TIMEOUT_MS + 1_000,
     onStateChange: (state, previous) => {
       setCircuitState(BILLING_CIRCUIT, state);
-      logger.warn({ circuit: BILLING_CIRCUIT, state, previous }, 'Circuit breaker state changed');
+      if (state !== previous) {
+        logger.warn({ circuit: BILLING_CIRCUIT, state, previous }, 'Circuit breaker state changed');
+      }
     },
   });
 

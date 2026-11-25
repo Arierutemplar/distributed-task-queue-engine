@@ -10,7 +10,7 @@ import {
 } from './bootstrap.js';
 import { config, runsApi, runsWorker } from './config/env.js';
 import { logger } from './config/logger.js';
-import { pingRedis, redis } from './config/redis.js';
+import { coordinationRedis, pingRedis, redis } from './config/redis.js';
 import { AUDIT_STREAM_KEY_SUFFIX, createAuditLog } from './observability/audit.js';
 import { initTracing, type TracingHandle } from './observability/tracing.js';
 import { deadLetterQueue } from './queues/dead-letter.queue.js';
@@ -40,6 +40,7 @@ const lifecycle = createGracefulShutdown({
     steps.push(
       { name: 'task queue', close: () => taskQueue.close() },
       { name: 'dead-letter queue', close: () => deadLetterQueue.close() },
+      { name: 'Redis coordination connection', close: () => coordinationRedis.quit() },
       { name: 'Redis connection', close: () => redis.quit() },
     );
     if (activeTracing) {
@@ -97,7 +98,7 @@ const startServer = async (): Promise<void> => {
       worker,
     }),
     createRateLimitStore: runsApi(config.PROCESS_ROLE)
-      ? redisRateLimitStoreFactory(redis, config.SERVICE_NAME)
+      ? redisRateLimitStoreFactory(coordinationRedis, config.SERVICE_NAME)
       : undefined,
     auditLog: createAuditLog({
       logger,

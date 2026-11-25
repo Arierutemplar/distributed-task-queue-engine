@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import { UnrecoverableError, type Job } from 'bullmq';
 import type { Logger } from 'pino';
 import type { BillingGateway } from '../services/billing.mock.service.js';
-import type { CircuitBreaker } from '../resilience/circuit-breaker.js';
 import { withTimeout } from '../resilience/timeout.js';
 import { withJobSpan } from '../observability/tracing.js';
 import {
@@ -17,7 +16,7 @@ export type TaskJob = Job<TaskJobData, TaskResult, TaskType>;
 
 export interface TaskProcessorDependencies {
   billing: BillingGateway;
-  billingCircuit: CircuitBreaker;
+  billingCircuit: { execute: <T>(operation: () => Promise<T>) => Promise<T> };
   timeoutMs: number;
   logger: Logger;
 }

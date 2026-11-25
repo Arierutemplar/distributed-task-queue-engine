@@ -1,0 +1,444 @@
+openapi: 3.0.3
+info:
+  title: Distributed Task Queue Engine
+  version: 1.0.0
+  description: |
+    Task and admin routes are available in API and all roles. Metrics can be disabled.
+    In non-production environments without API_KEYS, task requests use the public tenant.
+    X-Request-Id is echoed on every response; invalid values are replaced.
+paths:
+  /health/live:
+    get:
+      summary: Liveness
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, uptimeSeconds]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  uptimeSeconds: { type: integer, minimum: 0 }
+  /health/ready:
+    get:
+      summary: Readiness of configured dependencies
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          $ref: '#/components/responses/Readiness'
+        '503':
+          $ref: '#/components/responses/Readiness'
+  /metrics:
+    get:
+      summary: Prometheus exposition, when enabled
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Prometheus metrics
+          content:
+            text/plain:
+              schema: { type: string }
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+  /api/v1/tasks/process:
+    post:
+      summary: Enqueue a task
+      description: Reusing a key with the same payload and tenant returns the original acceptance; a different payload returns 409. Retention bounds idempotency.
+      security:
+        - ApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: Idempotency-Key
+          in: header
+          schema: { type: string, minLength: 1, maxLength: 255, pattern: '^[!-~]+$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskPayload'
+      responses:
+        '202':
+          description: Accepted or idempotently replayed
+          headers:
+            Location:
+              schema: { type: string }
+            Idempotent-Replayed:
+              description: Present and true when replayed
+              schema: { type: string, enum: ['true'] }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /api/v1/tasks/{taskId}:
+    get:
+      summary: Read a task owned by the authenticated tenant
+      security:
+        - ApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Task status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskStatus' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /admin/queues:
+    get:
+      summary: Bull Board UI
+      description: Bull Board also serves its own assets and API under this path; the dead-letter queue is read-only in the UI.
+      security:
+        - BasicAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Bull Board HTML
+          content:
+            text/html:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '429': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /admin/api/dead-letter:
+    get:
+      summary: List dead-letter entries
+      security:
+        - BasicAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Page of waiting dead-letter entries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [total, limit, offset, items]
+                properties:
+                  total: { type: integer }
+                  limit: { type: integer }
+                  offset: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeadLetter' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '429': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /admin/api/dead-letter/{taskId}/replay:
+    post:
+      summary: Replay with a new task ID and the original tenant
+      security:
+        - BasicAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '202':
+          description: Replay accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Accepted'
+                  - type: object
+                    required: [replayOf]
+                    properties:
+                      replayOf: { type: string }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /admin/api/dead-letter/{taskId}:
+    delete:
+      summary: Delete a dead-letter entry
+      security:
+        - BasicAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '204': { description: Entry deleted }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '404': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /admin/api/audit:
+    get:
+      summary: Read recent admin audit records
+      security:
+        - BasicAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        '200':
+          description: Audit records, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditRecord' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '429': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    ApiKey: { type: apiKey, in: header, name: X-API-Key }
+    BasicAuth: { type: http, scheme: basic }
+  parameters:
+    RequestId:
+      name: X-Request-Id
+      in: header
+      schema: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9._-]+$' }
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 200, pattern: '^[A-Za-z0-9_-]+$' }
+  responses:
+    Error:
+      description: Request failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnauthorizedAdmin:
+      description: Basic credentials required
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Readiness:
+      description: Dependency check results
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [status, checks]
+            properties:
+              status: { type: string, enum: [ready, not_ready] }
+              checks:
+                type: object
+                additionalProperties:
+                  type: object
+                  required: [status]
+                  properties:
+                    status: { type: string, enum: [up, down] }
+                    error: { type: string }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        requestId: { type: string }
+        issues:
+          type: array
+          items:
+            type: object
+            required: [path, message]
+            properties:
+              path: { type: string }
+              message: { type: string }
+    TaskPayload:
+      oneOf:
+        - $ref: '#/components/schemas/ProcessDocument'
+        - $ref: '#/components/schemas/SendNotification'
+        - $ref: '#/components/schemas/ProcessInvoice'
+      discriminator:
+        propertyName: type
+        mapping:
+          PROCESS_DOCUMENT: '#/components/schemas/ProcessDocument'
+          SEND_NOTIFICATION: '#/components/schemas/SendNotification'
+          PROCESS_INVOICE: '#/components/schemas/ProcessInvoice'
+    ProcessDocument:
+      type: object
+      required: [type, documentId, content]
+      properties:
+        type: { type: string, enum: [PROCESS_DOCUMENT] }
+        documentId: { type: string, minLength: 1, maxLength: 200, pattern: '\S' }
+        content: { type: string, minLength: 1, maxLength: 1000000 }
+    SendNotification:
+      type: object
+      required: [type, recipient, subject, message]
+      properties:
+        type: { type: string, enum: [SEND_NOTIFICATION] }
+        recipient: { type: string, format: email, maxLength: 320 }
+        subject: { type: string, minLength: 1, maxLength: 200, pattern: '\S' }
+        message: { type: string, minLength: 1, maxLength: 10000 }
+    ProcessInvoice:
+      type: object
+      required: [type, customerId, amount, currency, taxId, items]
+      properties:
+        type: { type: string, enum: [PROCESS_INVOICE] }
+        customerId: { type: string, minLength: 1, maxLength: 200, pattern: '\S' }
+        amount: { type: number, exclusiveMinimum: true, minimum: 0 }
+        currency: { type: string, minLength: 1, maxLength: 10, pattern: '\S' }
+        taxId: { type: string, minLength: 1, maxLength: 100, pattern: '\S' }
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [description, quantity, unitPrice]
+            properties:
+              description: { type: string, minLength: 1, maxLength: 500, pattern: '\S' }
+              quantity: { type: integer, minimum: 1 }
+              unitPrice: { type: number, exclusiveMinimum: true, minimum: 0 }
+    Accepted:
+      type: object
+      required: [taskId, taskType, status, acceptedAt]
+      properties:
+        taskId: { type: string }
+        taskType: { $ref: '#/components/schemas/TaskType' }
+        status: { type: string, enum: [accepted] }
+        acceptedAt: { type: string, format: date-time }
+    TaskType:
+      type: string
+      enum: [PROCESS_DOCUMENT, SEND_NOTIFICATION, PROCESS_INVOICE]
+    TaskStatus:
+      type: object
+      required:
+        [
+          taskId,
+          taskType,
+          state,
+          attemptsMade,
+          maxAttempts,
+          acceptedAt,
+          processedAt,
+          finishedAt,
+          result,
+          failedReason,
+        ]
+      properties:
+        taskId: { type: string }
+        taskType: { $ref: '#/components/schemas/TaskType' }
+        state:
+          {
+            type: string,
+            enum:
+              [
+                waiting,
+                waiting-children,
+                prioritized,
+                active,
+                delayed,
+                completed,
+                failed,
+                dead-lettered,
+                unknown,
+              ],
+          }
+        attemptsMade: { type: integer }
+        maxAttempts: { type: integer }
+        acceptedAt: { type: string, format: date-time, nullable: true }
+        processedAt: { type: string, format: date-time, nullable: true }
+        finishedAt: { type: string, format: date-time, nullable: true }
+        failedReason: { type: string, nullable: true }
+        result:
+          nullable: true
+          description: Discriminated by taskType; null before completion.
+          oneOf:
+            - $ref: '#/components/schemas/DocumentResult'
+            - $ref: '#/components/schemas/NotificationResult'
+            - $ref: '#/components/schemas/InvoiceResult'
+    DocumentResult:
+      type: object
+      required: [taskType, documentId, characterCount, wordCount, sha256, completedAt]
+      properties:
+        taskType: { type: string, enum: [PROCESS_DOCUMENT] }
+        documentId: { type: string }
+        characterCount: { type: integer, minimum: 0 }
+        wordCount: { type: integer, minimum: 0 }
+        sha256: { type: string, minLength: 64, maxLength: 64 }
+        completedAt: { type: string, format: date-time }
+    NotificationResult:
+      type: object
+      required: [taskType, notificationId, status, processedAt]
+      properties:
+        taskType: { type: string, enum: [SEND_NOTIFICATION] }
+        notificationId: { type: string }
+        status: { type: string, enum: [processed] }
+        processedAt: { type: string, format: date-time }
+    InvoiceResult:
+      type: object
+      required: [taskType, invoiceId, status, pdfUrl, processedAt]
+      properties:
+        taskType: { type: string, enum: [PROCESS_INVOICE] }
+        invoiceId: { type: string, format: uuid }
+        status: { type: string, enum: [PAID] }
+        pdfUrl: { type: string, format: uri }
+        processedAt: { type: string, format: date-time }
+    DeadLetter:
+      type: object
+      required: [taskId, taskType, failedReason, attemptsMade, failedAt, requestId, tenantId]
+      properties:
+        taskId: { type: string }
+        taskType: { $ref: '#/components/schemas/TaskType' }
+        failedReason: { type: string }
+        attemptsMade: { type: integer }
+        failedAt: { type: string, format: date-time }
+        requestId: { type: string, nullable: true }
+        tenantId: { type: string }
+    AuditRecord:
+      type: object
+      required: [timestamp, action, outcome, actor, requestId, method, path]
+      properties:
+        id: { type: string }
+        timestamp: { type: string, format: date-time }
+        action: { type: string }
+        outcome: { type: string, enum: [success, denied, not_found, invalid, error] }
+        actor: { type: string, nullable: true }
+        requestId: { type: string }
+        method: { type: string }
+        path: { type: string }
+        ip: { type: string }
+        statusCode: { type: integer }
+        tenantId: { type: string }
+        taskId: { type: string }
+        newTaskId: { type: string }
+        reason: { type: string }

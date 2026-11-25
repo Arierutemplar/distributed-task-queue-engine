@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({
   getWaitingCount: vi.fn(),
 }));
 
-vi.mock('../src/config/redis.js', () => ({ redis: {}, pingRedis: vi.fn() }));
+vi.mock('../src/config/redis.js', () => ({ redis: {}, coordinationRedis: {}, pingRedis: vi.fn() }));
 
 vi.mock('../src/queues/task.queue.js', () => ({
   TASK_QUEUE_NAME: 'tasks',
@@ -268,6 +268,68 @@ describe('admin surface', () => {
     ]);
   });
 
+  it('validates pagination and ids and audits invalid or missing replay entries', async () => {
+    const app = await buildApp();
+    const auth = basic('admin', ADMIN_PASSWORD);
+    expect(
+      (await request(app).get('/admin/api/dead-letter?limit=0').set('Authorization', auth)).status,
+    ).toBe(400);
+    for (const method of ['post', 'delete'] as const) {
+      const suffix = method === 'post' ? '/replay' : '';
+      expect(
+        (
+          await request(app)
+            [method](`/admin/api/dead-letter/bad:id${suffix}`)
+            .set('Authorization', auth)
+        ).status,
+      ).toBe(400);
+    }
+    mocks.deadLetterGetJob.mockResolvedValueOnce(undefined);
+    expect(
+      (await request(app).post('/admin/api/dead-letter/missing/replay').set('Authorization', auth))
+        .status,
+    ).toBe(404);
+    expect(auditLog.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'dead_letter.replay', outcome: 'not_found' }),
+    );
+  });
+
+  it('rejects outdated replay payloads and reports Redis failures for list, replay and delete', async () => {
+    const app = await buildApp();
+    const auth = basic('admin', ADMIN_PASSWORD);
+    mocks.deadLetterGetJob.mockResolvedValueOnce({
+      data: { data: { type: 'UNKNOWN' } },
+    });
+    const invalid = await request(app)
+      .post('/admin/api/dead-letter/42/replay')
+      .set('Authorization', auth);
+    expect(invalid.status).toBe(422);
+    expect(auditLog.record).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'invalid', taskId: '42', tenantId: 'public' }),
+    );
+    mocks.getWaitingCount.mockRejectedValueOnce(new Error('redis down'));
+    expect(
+      (await request(app).get('/admin/api/dead-letter').set('Authorization', auth)).status,
+    ).toBe(500);
+    for (const method of ['post', 'delete'] as const) {
+      mocks.deadLetterGetJob.mockRejectedValueOnce(new Error('redis down'));
+      const suffix = method === 'post' ? '/replay' : '';
+      expect(
+        (
+          await request(app)
+            [method](`/admin/api/dead-letter/42${suffix}`)
+            .set('Authorization', auth)
+        ).status,
+      ).toBe(500);
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: `dead_letter.${method === 'post' ? 'replay' : 'delete'}`,
+          outcome: 'error',
+        }),
+      );
+    }
+  });
+
   it('audits rejected credentials and lockouts without recording any secret', async () => {
     const app = await buildApp({ ADMIN_AUTH_MAX_FAILURES: '1' });
     await request(app)
@@ -323,6 +385,31 @@ describe('rate limiting', () => {
     const limited = await send();
     expect(limited.status).toBe(429);
     expect(limited.body.error).toBe('Too many requests');
+  });
+
+  it('logs store failures and preserves authentication while rate limits fail open', async () => {
+    const logError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const app = await createApp({
+        config: loadConfig({
+          NODE_ENV: 'test',
+          API_KEYS: 'test-key-0123456789abcdef0123456789',
+          ADMIN_PASSWORD,
+        }),
+        createRateLimitStore: () => ({
+          increment: async () => {
+            throw new Error('Redis unavailable');
+          },
+          decrement: async () => undefined,
+          resetKey: async () => undefined,
+        }),
+      });
+      expect((await request(app).get('/api/v1/tasks/missing')).status).toBe(401);
+      expect((await request(app).get('/admin/queues')).status).toBe(401);
+      expect(logError).toHaveBeenCalled();
+    } finally {
+      logError.mockRestore();
+    }
   });
 });
 

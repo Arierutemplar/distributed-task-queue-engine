@@ -21,10 +21,10 @@ export default defineConfig({
       reportsDirectory: 'coverage',
       // Ratchet these up as coverage grows; CI fails below them.
       thresholds: {
-        lines: 80,
-        statements: 80,
-        functions: 80,
-        branches: 70,
+        lines: 85,
+        statements: 85,
+        functions: 83,
+        branches: 78,
       },
     },
   },

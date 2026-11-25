@@ -4,7 +4,7 @@ import request from 'supertest';
 import { afterAll, describe, expect, it } from 'vitest';
 import { closeServer, createGracefulShutdown } from '../../src/bootstrap.js';
 import { logger } from '../../src/config/logger.js';
-import { redis } from '../../src/config/redis.js';
+import { coordinationRedis, redis } from '../../src/config/redis.js';
 import { deadLetterQueue } from '../../src/queues/dead-letter.queue.js';
 import { taskQueue } from '../../src/queues/task.queue.js';
 import { createTaskWorker } from '../../src/workers/task.worker.js';
@@ -18,6 +18,7 @@ describe('graceful shutdown against a real Redis', () => {
     if (!closed) {
       await taskQueue.close();
       await deadLetterQueue.close();
+      await coordinationRedis.quit();
       await redis.quit();
     }
   });
@@ -75,6 +76,12 @@ describe('graceful shutdown against a real Redis', () => {
           close: async () => {
             await deadLetterQueue.close();
             order.push('dlq');
+          },
+        },
+        {
+          name: 'Redis coordination connection',
+          close: async () => {
+            await coordinationRedis.quit();
           },
         },
         {

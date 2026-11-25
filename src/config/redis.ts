@@ -24,6 +24,17 @@ export const redis = config.REDIS_URL
       password: config.REDIS_PASSWORD,
     });
 
+// Coordination commands must fail promptly rather than wait indefinitely in BullMQ's offline queue.
+export const coordinationRedis = redis.duplicate({
+  connectionName: `${config.SERVICE_NAME}-coordination`,
+  maxRetriesPerRequest: 1,
+  enableOfflineQueue: false,
+  commandTimeout: 1_000,
+});
+coordinationRedis.on('error', (error: Error) => {
+  logger.error({ err: error }, 'Redis coordination connection error');
+});
+
 redis.on('connect', () => {
   logger.info('Redis connection established');
 });

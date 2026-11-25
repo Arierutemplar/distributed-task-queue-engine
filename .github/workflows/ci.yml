@@ -84,6 +84,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build and start the stack with a dedicated worker
         run: docker compose --profile scale-out up --build -d --wait --scale worker=2
+      - name: Scan application image for high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@v0.28.0
+        with:
+          image-ref: distributed-task-queue:local
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
       - name: Smoke test
         run: |
           set -euo pipefail
