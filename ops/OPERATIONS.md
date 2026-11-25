@@ -28,6 +28,148 @@ The local Keycloak/OpenBao/MinIO profiles are development fixtures, not producti
 Prometheus scrape health is not an external availability measurement. Configure an
 external authenticated probe, alert delivery/Alertmanager, ownership and escalation.
 
+## Alert ownership and response
+
+The production Prometheus overlay loads `ops/prometheus/operational-rules.yml`.
+Each alert has `severity`, `team`, `owner` and `runbook_url`. `platform-oncall`
+owns API, queue, circuit, DLQ, maintenance and backup alerts; `security-oncall`
+owns audit delivery alerts. These are **role identifiers**, not configured
+people or paging destinations: before production, assign real primary/secondary
+on-call staff and escalation contacts, route critical and warning alerts to
+appropriate Alertmanager receivers, and test delivery and acknowledgement.
+The default observability profile does not load these production rules or provide
+an Alertmanager receiver. Thresholds (including 100 queued jobs) are starting
+points and must be tuned against measured workload and capacity.
+
+Validate rules and representative firing cases with the Prometheus image:
+
+```powershell
+$mount = (Join-Path (Get-Location).Path 'ops\prometheus') + ':/etc/prometheus:ro'
+docker run --rm --entrypoint promtool -v $mount prom/prometheus check rules /etc/prometheus/operational-rules.yml
+docker run --rm --entrypoint promtool -v $mount prom/prometheus test rules /etc/prometheus/operational-rules.test.yml
+```
+
+### Alert: API errors
+
+**Owner: platform-oncall; critical.** Check the external probe and TLS proxy, then
+API readiness, Redis connectivity and 5xx logs by request ID. Escalate an outage,
+restore the failing dependency and verify authenticated submissions. `up` tests
+scrapes, not end-user availability; a no-traffic error ratio has no samples.
+
+### Alert: queue saturation
+
+**Owner: platform-oncall; warning.** Check waiting/paused/prioritized counts,
+admission rejections, worker health, throughput, retries and Redis capacity.
+Mitigate load or restore workers before changing quotas; confirm backlog drains
+and acceptance/completion latency recovers. Queue gauges repeat across replicas;
+the rule takes the maximum per-instance total rather than summing copies.
+
+### Alert: circuit and DLQ
+
+**Owner: platform-oncall; warning for circuit/DLQ, critical for stale maintenance.**
+Inspect billing dependency and worker logs, reconcile ambiguous external effects
+using their original idempotency keys, then replay only reviewed DLQ jobs. Verify
+maintenance is running and backlog drains. Circuit metrics are each worker's
+last observed state, so confirm the shared circuit before acting.
+
+### Alert: audit delivery
+
+**Owner: security-oncall; critical for enqueue failure, warning for backlog.**
+Check archival credentials, storage and outbox worker; restore delivery without
+deleting pending jobs. For enqueue failures reconcile application logs and the
+Redis audit stream, since the archive may have a gap. Escalate to platform-oncall
+for infrastructure failures and verify archived records after recovery.
+
+### Alert: backup
+
+**Owner: platform-oncall; critical for stale/unavailable backup, warning for failed
+attempts.** Check agent health, destination access, encryption keys, snapshot
+size, bandwidth and the timestamp of the last remotely verified version. Restore
+the latest known-good version in isolation; escalate before the RPO expires.
+Freshness alone is not proof that a production restore or off-host storage works.
+
+## External monitoring probe
+
+Run the probe from a separate monitoring machine/network, against the externally
+reachable TLS proxy. It checks `/health/ready` and `/metrics`, emits JSON with
+status and per-request latency, and exits nonzero on failures. Configure external
+monitoring to schedule it, retain results and page its own independent receiver.
+The probe does not submit a task and is not an authenticated end-to-end availability
+measurement. Restrict metrics access at the proxy; if it requires a bearer token,
+set `EXTERNAL_PROBE_BEARER_TOKEN` securely in the probe environment. Requests time
+out after 5 seconds by default; `EXTERNAL_PROBE_TIMEOUT_MS` accepts 1–60000.
+
+For the default local stack, run from the host, outside the Compose network:
+
+```powershell
+node ops\reliability\external-probe.js http://127.0.0.1:3000
+```
+
+For real external monitoring replace the URL with `https://your-proxy.example`.
+HTTP is accepted only for loopback development. A host-local success does not
+survive host failure or establish independent monitoring.
+
+## Simulated host loss
+
+The standalone `docker-compose.multihost.yml` is an isolated, single-engine
+failure-domain fixture. `host-a` and `host-b` each contain Redis, Sentinel, API and
+worker; `witness` contains the third Sentinel. Quorum is two. A third independent
+voting domain is necessary for majority after losing either of the two application
+domains. Domain labels drive the exercise; the shared bridge is not a physical
+network or machine boundary.
+
+From the repository root, run:
+
+```powershell
+node ops\multihost\drill.js both
+# Or select one domain:
+node ops\multihost\drill.js host-a
+node ops\multihost\drill.js host-b
+```
+
+The command builds and starts its own uniquely named project and image, chooses a
+non-overlapping subnet, and uses SIGKILL on every service in the selected domain.
+It checks surviving Sentinel quorum and primary, API/worker readiness, task
+completion and hashes, and restores Redis and Sentinel before allowing the
+returning API/worker to start. A Redis `WAIT` barrier confirms replica receipt of
+preceding writes before failure. `both` fails A first, then B, so both primary
+promotions are exercised. `host-b` alone starts with B as the replica and tests
+its loss without a promotion. The JSON report records each scenario. Normal
+success or failure removes only the fixture's project, volumes and image; if
+the process is interrupted externally, inspect `docker compose ls --all` and
+clean up only the identified fixture.
+
+To launch a separate manual fixture without changing `.env` or the default stack,
+use a fresh PowerShell session and a unique project/image:
+
+```powershell
+$project = "dtq-mh-manual-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+$env:DTQ_MH_IMAGE = "${project}:local"
+$env:DTQ_MH_REDIS_PASSWORD = [guid]::NewGuid().ToString('N')
+$env:DTQ_MH_API_KEY = "fixture-$([guid]::NewGuid().ToString('N'))"
+docker compose -p $project -f docker-compose.multihost.yml build api-a
+docker compose -p $project -f docker-compose.multihost.yml up -d --no-build --wait
+docker compose -p $project -f docker-compose.multihost.yml ps
+# The automated exercise above creates its own fixture; it does not kill this one.
+# When finished, delete only this disposable project's volumes and image:
+docker compose -p $project -f docker-compose.multihost.yml down -v --remove-orphans
+docker image rm $env:DTQ_MH_IMAGE
+```
+
+The manual fixture defaults to subnet `172.31.251.0/24`. If it overlaps an existing
+network, set `DTQ_MH_SUBNET`, `DTQ_MH_REDIS_A_IP`, `DTQ_MH_REDIS_B_IP` and
+`DTQ_MH_SENTINEL_A_IP`, `DTQ_MH_SENTINEL_B_IP`, `DTQ_MH_SENTINEL_W_IP` to
+distinct addresses in a free subnet before starting. Its APIs are reachable only
+inside the Compose network.
+
+This verifies container-level behavior and sampled state, not actual host HA,
+exhaustive state integrity, network partitions, loss of a disk/engine, or zero
+RPO. Redis replication is asynchronous; `WAIT` acknowledges replica receipt, not
+durable persistence. On a real system deploy the two data/app domains and the
+witness in independent physical/VM failure domains, provide secure routing and
+client-reachable advertised addresses, test fencing and partition recovery, and
+use independent backups. Do not rely on this fixture as a production deployment.
+
 ## Delivery and retention
 
 - Set `QUEUE_MAX_WAITING` and `TENANT_MAX_INFLIGHT` consistently on all API
@@ -55,9 +197,25 @@ external authenticated probe, alert delivery/Alertmanager, ownership and escalat
 - Task delivery is **at least once**, not exactly once. A 202 means Redis accepted the
   job; asynchronous replication and `appendfsync everysec` can lose recent acknowledged
   writes. Sentinel does not provide zero RPO. RPO depends on off-host backups remaining fresh.
-- Optional idempotency survives only while its original job is retained. External
-  billing/notification handlers must deduplicate business effects with durable business IDs.
-  Current billing/notification integrations remain demonstrative.
+- HTTP admission deduplication and 409 conflict detection survive only while the
+  original BullMQ job is retained. Invoice effects have separate Redis records
+  (`in_progress`/`completed`, fingerprint and result), retained for
+  `EFFECT_RETENTION_SECONDS` (default 30 days, range 3600–31536000). The local
+  payment simulator stores its result and `executions=1` separately with the same
+  configured TTL from application time. A completed effect record's TTL starts
+  again on completion; an in-progress record's TTL starts on the first attempt.
+  Keep the service name, tenant identity and configuration consistent on replicas;
+  size retention for the maximum retry, DLQ and recovery window, monitor Redis
+  capacity, and retain provider keys at least as long.
+- Reuse the same tenant and `Idempotency-Key` for uncertain HTTP retries. A worker
+  retry or DLQ replay propagates the same provider key; independent submissions
+  without that header do not deduplicate. An `in_progress` record does not lock a
+  provider call. If the call committed but the response or Redis completion was
+  lost, retry/reconcile with the same key. Real providers must atomically persist
+  key, payload identity and result independently; if they do not, duplicate
+  charges or notifications remain possible. The local payment simulator shares
+  Redis with the queue and is not evidence against primary/replica data loss.
+  Notification processing currently does not send an external notification.
 - `DLQ_RECONCILE_ENABLED=true` scans retained terminal failures in bounded batches and
   uses the existing atomic generation-aware routing script. It repairs a lost failed-event
   callback, avoids duplicates, and respects operator deletion of an already routed entry.
@@ -156,6 +314,12 @@ master, not a hardcoded original-primary IP.
 `restore-check` always uses a **new isolated loopback Redis**, no AOF, and a separate
 probe queue executing the real document handler. It reports restored task/outbox counts,
 RPO and technical restore time. It never runs restored invoices/notifications.
+Optionally set `RESTORE_SAMPLE_MANIFEST` on that command to a JSON manifest captured
+independently before the snapshot by `captureRestoreSamples`; restore fails if any
+sampled job state/content/result/failure or audit stream entry differs. The manifest
+contains identifiers and hashes, not task payloads. Protect and retain it separately
+from the backup, and select samples before capture; matching samples do not prove all
+keys are intact.
 
 ### Real disaster recovery
 
@@ -209,6 +373,21 @@ non-overlapping Docker subnet, and removes only its own containers/volumes/image
 It tests sustained/pulse load, archive outage plus restart recovery, lost DLQ callback,
 actual primary-container stop/Sentinel promotion, prior-task preservation, new-task
 completion, and encrypted backup/restore **including pending audit state**.
+The restore phase stops its own fixture app, seeds completed, failed, waiting and
+delayed tasks, a DLQ entry, pending audit outbox and an audit stream record. It
+captures a manifest before backup, uploads the encrypted snapshot to the fixture
+S3 service's separate volume, downloads it and compares all seven samples in a
+fresh isolated Redis. It also checks an exported RDB. Run the entire representative
+restore scenario with:
+
+```powershell
+npm run ops:reliability
+```
+
+The weekly scheduled workflow runs this same exercise. Its fixture S3 volume is
+separate from active Redis data but still on the same machine; it is **not off-host
+storage**, does not prove Object Lock or survival of host loss, and is deleted with
+the fixture. Use the real off-host bucket procedure above for production evidence.
 Set `RELIABILITY_REPORT` to save the JSON report and `RELIABILITY_LOAD_SECONDS` to
 increase the sustained run (5..300). Logs/errors are not a substitute for passed gates.
 

@@ -38,6 +38,8 @@ const buildProcessor = (
 ) =>
   createTaskProcessor({
     billing,
+    effects: { begin: async () => undefined, complete: async (_key, _hash, result) => result },
+    effectNamespace: 'test',
     billingCircuit: new CircuitBreaker({
       name: 'billing',
       failureThreshold: overrides.threshold ?? 5,
@@ -93,6 +95,20 @@ describe('task processor', () => {
   it('returns a PAID invoice when billing succeeds', async () => {
     const result = await buildProcessor(instantBilling(0))(fakeJob(invoice));
     expect(result).toMatchObject({ taskType: 'PROCESS_INVOICE', status: 'PAID' });
+  });
+
+  it('propagates the same tenant-scoped effect key on retries and replay', async () => {
+    const billing = instantBilling(0);
+    const processInvoice = vi.spyOn(billing, 'processInvoice');
+    const processor = buildProcessor(billing);
+    await processor(fakeJob({ ...invoice, meta: { tenantId: 'a', effectId: 'original' } }));
+    await processor(
+      fakeJob({ ...invoice, meta: { tenantId: 'a', effectId: 'original', replayOf: '2' } }, 1),
+    );
+    await processor(fakeJob({ ...invoice, meta: { tenantId: 'b', effectId: 'original' } }));
+    const identities = processInvoice.mock.calls.map((call) => call[2]);
+    expect(identities[0]).toEqual(identities[1]);
+    expect(identities[2]?.key).not.toBe(identities[0]?.key);
   });
 
   it('rethrows the billing exception so BullMQ applies backoff', async () => {

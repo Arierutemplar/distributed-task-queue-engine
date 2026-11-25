@@ -116,6 +116,7 @@ export const createDeadLetterRouter = (audit: AuditLog): Router => {
         requestId: getRequestId(response.locals),
         tenantId,
         replayOf: taskId,
+        effectId: entry.data.data.meta?.effectId ?? entry.data.data.meta?.replayOf ?? taskId,
         limits: response.locals.admissionLimits as AdmissionLimits | undefined,
       });
       await entry.remove();

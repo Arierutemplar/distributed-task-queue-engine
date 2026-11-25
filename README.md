@@ -8,9 +8,10 @@ This repository is a working reference for that flow. The invoice handler is a m
 
 ## Key Architectural Highlights
 
-- **Queue.** `POST /api/v1/tasks/process` validates the body with a Zod discriminated union on `type`, then calls `Queue.add` on the BullMQ queue named `tasks`. The job name is the task type. The job data is the validated payload plus a `meta` object: `requestId`, `payloadHash` (SHA-256 of the canonical payload), `acceptedAt`, and, when present, `idempotencyKey` or `replayOf`.
+- **Queue.** `POST /api/v1/tasks/process` validates the body with a Zod discriminated union on `type`, then calls `Queue.add` on the BullMQ queue named `tasks`. The job name is the task type. The job data is the validated payload plus a `meta` object: `requestId`, `payloadHash` (SHA-256 of the canonical payload), `acceptedAt`, `effectId`, and, when present, `idempotencyKey` or `replayOf`.
 - **Authentication and tenants.** Every task request carries an `X-API-Key` header that must match one of `API_KEYS`. An entry written as `tenantId:key` maps the key to a stable tenant, so several keys can share one tenant and a key can be rotated without losing access to its tasks; a plain `key` entry is its own tenant, identified by `key-<first 16 hex of sha256(key)>`. The tenant is stored in `meta.tenantId`. Optionally, `RATE_LIMIT_TENANT_MAX` caps requests per tenant (all of its keys together) per window. A tenant can only read its own tasks: another tenant's id returns `404`, the same as an unknown id. With `API_KEYS` unset (allowed only outside production) every caller shares the `public` tenant.
 - **Idempotency.** An optional `Idempotency-Key` header (1–255 printable ASCII characters) becomes the BullMQ job id `idem-<sha256(tenantId + key)>`, so two tenants can use the same key independently. `Queue.add` with an existing id is atomic and does not create a second job, so concurrent duplicates converge on one job. The service then reads the stored job: same payload hash returns `202` with the original `taskId` and `acceptedAt` plus `Idempotent-Replayed: true`; a different payload returns `409`. The idempotency window equals job retention (see below). Without the header, every request creates a new job.
+- **Invoice effects.** A separate Redis effect record tracks `in_progress` and `completed`, payload fingerprint and result for `EFFECT_RETENTION_SECONDS` (default 30 days). Reattempts and DLQ replay retain a stable, tenant-scoped provider key; a completed record returns its stored result without another provider call. An in-progress record is not a lock: a retry may call the provider again with the same key, so the provider must atomically deduplicate it. The local billing simulator does this and records `executions=1` in its own Redis hash. It is not a payment provider.
 - **Worker.** `createTaskWorker()` starts a BullMQ `Worker` on `tasks`. `WORKER_CONCURRENCY` sets how many jobs one process runs at once (default 10, accepted range 1–1000). All configuration is parsed once by a Zod schema in `src/config/env.ts`; an invalid value stops the process before it connects to anything.
 - **Admission capacity.** Optional `QUEUE_MAX_WAITING` and `TENANT_MAX_INFLIGHT` default to `0` (disabled). Waiting includes paused and prioritized jobs; tenant inflight also includes active jobs, delayed retries and waiting-children jobs. A Redis script checks and inserts atomically across API replicas. Full capacity returns `429` and `Retry-After: 1`; idempotent replays remain available. A tenant's finite inflight quota bounds its backlog, but workers still use FIFO rather than a strict fair scheduler.
 - **Job types.** `PROCESS_DOCUMENT` returns character count, word count, and a SHA-256 of the content. `SEND_NOTIFICATION` records a processed result. `PROCESS_INVOICE` calls `BillingMockService` through a circuit breaker; the mock waits 1.5–3 seconds and throws `BillingServiceException` with probability `BILLING_FAILURE_RATE` (default 0.2).
@@ -150,6 +151,7 @@ Node.js runtime metrics (event loop lag, heap, GC) are included. Successful `GET
 | `JOB_TIMEOUT_MS`                                   | `30000`                           | 1,000–600,000                                                                                                                                           |
 | `SHUTDOWN_TIMEOUT_MS`                              | `25000`                           | Keep below the orchestrator grace period                                                                                                                |
 | `BILLING_FAILURE_RATE`                             | `0.2`                             | 0–1; `1` forces every invoice to the dead-letter queue                                                                                                  |
+| `EFFECT_RETENTION_SECONDS`                         | `2592000`                         | Invoice effect and simulated payment retention; 3600–31536000 seconds                                                                                   |
 | `CIRCUIT_BREAKER_FAILURE_THRESHOLD`                | `5`                               |                                                                                                                                                         |
 | `CIRCUIT_BREAKER_RESET_TIMEOUT_MS`                 | `30000`                           |                                                                                                                                                         |
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX`          | `60000` / `300`                   | Per client IP, shared through Redis. `0` disables                                                                                                       |
@@ -166,9 +168,49 @@ Node.js runtime metrics (event loop lag, heap, GC) are included. Successful `GET
 | `METRICS_ENABLED`                                  | `true`                            |                                                                                                                                                         |
 | `LOG_LEVEL` / `SERVICE_NAME`                       | `info` / `distributed-task-queue` |                                                                                                                                                         |
 
+## Acceptance and business-effect guarantees
+
+A `202` means the current Redis primary accepted the queue write (or the retained
+job was replayed); it does **not** mean the task ran, the effect occurred, the
+write was fsynced, or a replica acknowledged it. A primary crash before
+asynchronous replication can lose an acknowledged task, its effect record, or
+both. `appendfsync everysec` also allows a persistence-loss window; Sentinel is
+not zero RPO. Clients should retain the same tenant and `Idempotency-Key` when
+retrying an uncertain submission.
+
+For invoices, `effectId` is stable for the same tenant/header, worker retries,
+stalled-job recovery and DLQ replay. Without a header, independent submissions
+get independent IDs. Worker records store the payload fingerprint and result;
+different payloads for a retained effect key fail rather than reuse the result.
+The HTTP `409` guarantee ends when the original BullMQ job is removed; a later
+conflicting invoice can be accepted and then fail in the worker. Completed effect
+records can outlive jobs, but neither result nor protection lasts beyond their
+configured retention. The simulated provider's own record expires separately
+from its creation time.
+
+Real payments require an independent provider that durably and atomically
+deduplicates the propagated key, returns the original outcome on retries, rejects
+payload mismatches and retains keys for at least the entire replay/recovery
+window. A timeout or crash after a provider commits but before Redis records
+completion is an ambiguous outcome: retry or reconcile with the **same key**.
+Redis alone cannot atomically commit an external payment; without provider-side
+idempotency or reconciliation no exactly-once effect is promised. The local
+payment simulator and its counter share the queue's Redis, so they cannot prove
+safety across Redis data loss. Notification handling still sends nothing.
+
+To exercise the partial-failure scenario, point `TEST_REDIS_URL` at a **disposable
+empty Redis database** (the integration suite flushes it), then run:
+
+```powershell
+npm run test:integration -- tests\integration\processing.int.test.ts
+```
+
+The test applies a simulated payment, loses the first response and retries with
+the same provider key; it checks one effective application and the stored result.
+
 ## What Is Not Implemented
 
-There is no transactional outbox: task acceptance writes to Redis only. Optional WORM audit archival is best-effort, not an atomic dual write with Redis. API keys have no self-service issuance or automatic expiry. API key reload does not rotate Redis, OIDC, admin or archive credentials, and Vault token renewal is not implemented. Sentinel restores access to a promoted replica, but asynchronous replication can lose acknowledged writes and is not a zero-data-loss guarantee. OIDC sessions end at access-token expiry, without refresh or immediate token revocation checks. The idempotency window ends when BullMQ's retention removes the job. Results live only as long as that retention. Timeouts are per process; the circuit is shared in Redis and counts consecutive completions rather than failures in a rolling time window. The dead-letter copy is not atomic with the failure (see above). The audit stream is capped and lives in the same Redis; optional S3 Object Lock protects successfully archived object versions, but there is no automatic retry/backfill or cryptographic audit chain. The billing service is a mock and notifications are not sent. Redis Cluster and Helm/Kubernetes manifests remain future work.
+There is no transactional outbox: task acceptance writes to Redis only. Optional WORM audit archival is best-effort, not an atomic dual write with Redis. API keys have no self-service issuance or automatic expiry. API key reload does not rotate Redis, OIDC, admin or archive credentials, and Vault token renewal is not implemented. Sentinel restores access to a promoted replica, but asynchronous replication can lose acknowledged writes and is not a zero-data-loss guarantee. OIDC sessions end at access-token expiry, without refresh or immediate token revocation checks. HTTP job idempotency and job results last only as long as job retention; the invoice effect record has a separate retention. Timeouts are per process; the circuit is shared in Redis and counts consecutive completions rather than failures in a rolling time window. The dead-letter copy is not atomic with the failure (see above). The audit stream is capped and lives in the same Redis; optional S3 Object Lock protects successfully archived object versions, but there is no automatic retry/backfill or cryptographic audit chain. The billing service is a mock and notifications are not sent. Redis Cluster and Helm/Kubernetes manifests remain future work.
 
 ## Testing Strategy
 
@@ -751,6 +793,39 @@ KV v2/AppRole and fail-fast startup in API/worker child processes; a local RESP
 Sentinel fake resolves the disposable test Redis and verifies client duplication.
 All existing standalone tests remain enabled.
 
+### Simulated host-loss exercise
+
+The separate [multi-host simulation](./docker-compose.multihost.yml) places an
+API, worker, Redis node and Sentinel in each of two labeled logical domains,
+`host-a` and `host-b`. A third independent logical domain contains the Sentinel
+witness: with only two domains, a majority cannot survive the loss of either.
+It publishes no host ports and does not alter the default Compose stack.
+
+From the repository root, run the disposable automated exercise:
+
+```powershell
+node ops\multihost\drill.js both
+# Alternatively: node ops\multihost\drill.js host-a
+# Or:            node ops\multihost\drill.js host-b
+```
+
+The script builds a uniquely named project, chooses an unused subnet, kills all
+services in the selected domain, tests quorum and task processing on the survivor,
+then verifies replication and sampled task results after rejoining. `both` first
+promotes B after losing A, then promotes A after losing B. On a fresh `host-b`
+run, B is initially the replica, so that scenario tests replica loss rather than
+primary promotion. The script removes its own project, volumes and image when it
+finishes; see the [runbook](ops/OPERATIONS.md#simulated-host-loss) for manual
+startup and cleanup.
+
+This is a **single Docker Engine simulation**, not actual multi-host HA: all
+domains share the engine, kernel, machine and bridge network. A real deployment
+needs separate machines/zones and an independent third Sentinel failure domain,
+client-reachable addresses, network security and external routing/health checks.
+The exercise does not prove partition safety, storage survival or zero data loss;
+Redis replication is asynchronous, and its replication barrier is not a durability
+guarantee.
+
 ### Git setup
 
 The repository ships a `.gitignore` (`node_modules`, `dist`, `coverage`, `.env`, `.env.*` except `.env.example`) and a `.gitattributes` that keeps LF line endings, which Prettier enforces. To start version control and enable CI:
@@ -776,3 +851,21 @@ p95 <= 5s under the declared workload, and RPO/RTO <= 15min. These are objective
 not an exactly-once/zero-loss or single-host HA guarantee. Run `npm run ops:reliability`
 for measured technical evidence; full incident RTO and monthly availability need
 external monitoring and real recovery exercises.
+
+Run the host-side readiness/metrics probe, or the isolated representative
+backup/restore exercise, from the repository root:
+
+```powershell
+node ops\reliability\external-probe.js http://127.0.0.1:3000
+npm run ops:reliability
+```
+
+The probe reports per-endpoint latency and exits nonzero on failures; run it
+from an independent machine against HTTPS for real external monitoring. The
+restore exercise checks sampled completed, failed, waiting and delayed jobs,
+DLQ and audit data in a new Redis after encrypted backup/download. Its separate
+storage volume still shares the local host, so it is not proof of off-host
+backup or disaster recovery. Production rules identify platform/security on-call
+roles and link to runbooks; actual on-call assignments and alert delivery must
+be configured separately. See the [runbook](ops/OPERATIONS.md) for rule tests,
+external probing, the weekly fixture and real off-host restoration.

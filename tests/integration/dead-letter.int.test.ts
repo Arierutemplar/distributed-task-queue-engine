@@ -203,6 +203,8 @@ describe('dead-letter queue and admin audit against a real Redis', () => {
 
   it('replays into a new job owned by the original tenant and removes the dead-letter entry', async () => {
     const taskId = await deadLetteredInvoice();
+    const original = await taskQueue.getJob(taskId);
+    if (!original?.data.meta?.effectId) throw new Error('Expected original effect identity');
     billingUp = true;
 
     const replay = await admin('post', `/admin/api/dead-letter/${taskId}/replay`).set(
@@ -213,6 +215,8 @@ describe('dead-letter queue and admin audit against a real Redis', () => {
     expect(replay.body.replayOf).toBe(taskId);
     const newTaskId = replay.body.taskId as string;
     expect(newTaskId).not.toBe(taskId);
+    const replayJob = await taskQueue.getJob(newTaskId);
+    expect(replayJob?.data.meta?.effectId).toBe(original.data.meta.effectId);
 
     expect(await deadLetterQueue.getJob(deadLetterJobId(taskId))).toBeUndefined();
     await waitForJobState(newTaskId, ['completed']);

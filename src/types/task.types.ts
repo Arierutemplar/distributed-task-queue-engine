@@ -74,6 +74,7 @@ export interface TaskJobMeta {
   acceptedAt: string;
   idempotencyKey?: string;
   replayOf?: string;
+  effectId?: string;
   /** W3C trace context of the request that accepted the task, when tracing is enabled. */
   traceparent?: string;
   tracestate?: string;

@@ -1,0 +1,89 @@
+rule_files:
+  - operational-rules.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'queue_jobs{service="demo",instance="a",queue="tasks",state="waiting"}'
+        values: '101+0x10'
+      - series: 'task_backpressure_rejections_total{service="demo",reason="queue"}'
+        values: '0+1x10'
+      - series: 'tasks_processed_total{service="demo",task_type="PROCESS_INVOICE",outcome="failed"}'
+        values: '0+1x10'
+      - series: 'circuit_breaker_state{service="demo",circuit="billing"}'
+        values: '2+0x10'
+      - series: 'queue_jobs{service="demo",instance="a",queue="tasks-dead-letter",state="waiting"}'
+        values: '1+0x10'
+      - series: 'audit_outbox_oldest_age_seconds{service="demo"}'
+        values: '301+0x10'
+      - series: 'http_request_duration_seconds_count{service="demo",role="all",route="/api/v1/tasks/process",status_code="500"}'
+        values: '0+1x10'
+      - series: 'http_request_duration_seconds_count{service="demo",role="all",route="/api/v1/tasks/process",status_code="202"}'
+        values: '0+9x10'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: TaskQueueApiErrorBudgetBurn
+        exp_alerts:
+          - exp_labels:
+              { service: demo, severity: critical, owner: platform-oncall, team: platform }
+            exp_annotations:
+              summary: 'API 5xx rate exceeds 14.4x the 99.9% error budget; not a monthly availability measurement'
+              runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-api-errors'
+      - eval_time: 7m
+        alertname: TaskQueueBacklogHigh
+        exp_alerts:
+          - exp_labels: { service: demo, severity: warning, owner: platform-oncall, team: platform }
+            exp_annotations:
+              summary: 'Queue waiting backlog exceeds 100 jobs'
+              runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-queue-saturation'
+      - eval_time: 7m
+        alertname: TaskQueueBackpressure
+        exp_alerts:
+          - exp_labels: { service: demo, severity: warning, owner: platform-oncall, team: platform }
+            exp_annotations:
+              summary: 'Queue or tenant admissions are being rejected'
+              runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-queue-saturation'
+      - eval_time: 7m
+        alertname: TaskQueueBillingCircuitOpen
+        exp_alerts:
+          - exp_labels:
+              {
+                service: demo,
+                circuit: billing,
+                severity: warning,
+                owner: platform-oncall,
+                team: platform,
+              }
+            exp_annotations:
+              summary: 'A worker last observed an open circuit; verify shared state'
+              runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-circuit-and-dlq'
+      - eval_time: 7m
+        alertname: TaskQueueAttemptsFailed
+        exp_alerts:
+          - exp_labels: { service: demo, severity: warning, owner: platform-oncall, team: platform }
+            exp_annotations:
+              summary: 'Task attempts are failing; inspect retries and DLQ'
+              runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-circuit-and-dlq'
+      - eval_time: 7m
+        alertname: TaskQueueDlqNeedsReview
+        exp_alerts:
+          - exp_labels:
+              {
+                service: demo,
+                instance: a,
+                queue: tasks-dead-letter,
+                state: waiting,
+                severity: warning,
+                owner: platform-oncall,
+                team: platform,
+              }
+            exp_annotations:
+              summary: 'Terminal failures require operator triage; retained originals need managed cleanup'
+              runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-circuit-and-dlq'
+      - eval_time: 7m
+        alertname: TaskQueueAuditBacklog
+        exp_alerts:
+          - exp_labels: { service: demo, severity: warning, owner: security-oncall, team: security }
+            exp_annotations:
+              summary: 'Audit archival backlog; age samples pending state heads, not exhaustive'
+              runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-audit-delivery'

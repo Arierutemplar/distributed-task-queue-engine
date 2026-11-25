@@ -1,13 +1,20 @@
 import type { Worker } from 'bullmq';
+import { randomUUID } from 'node:crypto';
 import request from 'supertest';
 import type { Express } from 'express';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { deadLetterJobId, deadLetterQueue } from '../../src/queues/dead-letter.queue.js';
+import { taskQueue } from '../../src/queues/task.queue.js';
+import { config } from '../../src/config/env.js';
+import { coordinationRedis, redis } from '../../src/config/redis.js';
 import {
+  BillingMockService,
   BillingServiceException,
   type BillingGateway,
 } from '../../src/services/billing.mock.service.js';
+import { effectKey, RedisEffectStore } from '../../src/services/effect-idempotency.js';
 import {
+  processInvoicePayloadSchema,
   taskResultSchema,
   type TaskJobData,
   type TaskResult,
@@ -146,6 +153,108 @@ describe('task processing against a real Redis', () => {
       async () =>
         (await metricValue('tasks_dead_lettered_total', { task_type: 'PROCESS_INVOICE' })) === 1,
       'tasks_dead_lettered_total to reach 1',
+    );
+  });
+
+  it('applies a simulated payment once when the first attempt fails after the effect', async () => {
+    const store = new RedisEffectStore(coordinationRedis, config.SERVICE_NAME, 3_600);
+    const provider = new BillingMockService({
+      failureRate: 0,
+      minLatencyMs: 0,
+      maxLatencyMs: 0,
+      store,
+    });
+    const keys: string[] = [];
+    const billing: BillingGateway = {
+      processInvoice: async (invoice, signal, identity) => {
+        keys.push(identity.key);
+        const result = await provider.processInvoice(invoice, signal, identity);
+        if (keys.length === 1) throw new Error('Connection lost after payment');
+        return result;
+      },
+    };
+    startWorker({ billing });
+    const taskId = await submit(invoicePayload);
+    await waitForJobState(taskId, ['completed']);
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+    const key = keys[0];
+    if (!key) throw new Error('Expected a payment idempotency key');
+    const payment = await redis.hgetall(`${config.SERVICE_NAME}:mock-payment:${key}`);
+    const effect = await redis.hgetall(`${config.SERVICE_NAME}:effect:${key}`);
+    if (!payment.result || !effect.fingerprint) throw new Error('Missing effect or payment record');
+    expect(payment.executions).toBe('1');
+    expect(effect.state).toBe('completed');
+    expect(effect.result).toBe(payment.result);
+    expect(await status(taskId)).toMatchObject({
+      attemptsMade: 2,
+      result: JSON.parse(payment.result),
+    });
+    expect(await store.begin(key, effect.fingerprint)).toEqual(JSON.parse(payment.result));
+    await expect(store.begin(key, 'different')).rejects.toThrow(/different payload/u);
+  });
+
+  it('records an effective payment with the default worker gateway', async () => {
+    startWorker({});
+    const taskId = await submit(invoicePayload);
+    await waitForJobState(taskId, ['completed']);
+    const job = await taskQueue.getJob(taskId);
+    const id = job?.data.meta?.effectId;
+    if (!id) throw new Error('Expected effect identity');
+    const key = effectKey(config.SERVICE_NAME, TENANT_A, id);
+    expect(await redis.hget(`${config.SERVICE_NAME}:mock-payment:${key}`, 'executions')).toBe('1');
+    expect(await redis.hget(`${config.SERVICE_NAME}:effect:${key}`, 'state')).toBe('completed');
+  });
+
+  it('reuses the completed effect after the original BullMQ job is removed', async () => {
+    const store = new RedisEffectStore(coordinationRedis, config.SERVICE_NAME, 3_600);
+    const provider = new BillingMockService({
+      failureRate: 0,
+      minLatencyMs: 0,
+      maxLatencyMs: 0,
+      store,
+    });
+    const billing = vi.fn(provider.processInvoice.bind(provider));
+    startWorker({ billing: { processInvoice: billing } });
+    const send = () =>
+      request(app)
+        .post('/api/v1/tasks/process')
+        .set('X-API-Key', KEY_A1)
+        .set('Idempotency-Key', 'payment-retry')
+        .send(invoicePayload);
+    const first = await send();
+    expect(first.status).toBe(202);
+    const taskId = first.body.taskId as string;
+    await waitForJobState(taskId, ['completed']);
+    const original = await status(taskId);
+    const job = await taskQueue.getJob(taskId);
+    if (!job) throw new Error('Expected completed task');
+    await job.remove();
+    const second = await send();
+    expect(second.status).toBe(202);
+    expect(second.body.taskId).toBe(taskId);
+    await waitForJobState(taskId, ['completed']);
+    expect((await status(taskId)).result).toEqual(original.result);
+    expect(billing).toHaveBeenCalledOnce();
+  });
+
+  it('atomically deduplicates concurrent simulated provider requests', async () => {
+    const store = new RedisEffectStore(coordinationRedis, config.SERVICE_NAME, 3_600);
+    const result = await paidInvoice(processInvoicePayloadSchema.parse(invoicePayload), undefined, {
+      key: 'unused',
+      fingerprint: 'unused',
+    });
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        store.applyMockPayment('concurrent', 'fingerprint', { ...result, invoiceId: randomUUID() }),
+      ),
+    );
+    expect(results.every((item) => item.invoiceId === results[0]?.invoiceId)).toBe(true);
+    expect(await redis.hget(`${config.SERVICE_NAME}:mock-payment:concurrent`, 'executions')).toBe(
+      '1',
+    );
+    await expect(store.applyMockPayment('concurrent', 'different', result)).rejects.toThrow(
+      /different payload/u,
     );
   });
 

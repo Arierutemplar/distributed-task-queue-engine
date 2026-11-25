@@ -28,6 +28,7 @@ import {
   createBackupStorage,
   loadBackupSettings,
 } from './backup.js';
+import { restoreManifestSchema, verifyRestoreSamples } from './restore-samples.js';
 
 const execute = (
   program: string,
@@ -241,6 +242,14 @@ const main = async (): Promise<void> => {
         'paused',
       );
       await Promise.all([original.close(), outbox.close()]);
+      const sampleInput = process.env.RESTORE_SAMPLE_MANIFEST;
+      let verifiedSamples: number | undefined;
+      if (sampleInput) {
+        if (sampleInput.length > 32_768) throw new BackupError('Restore sample manifest too large');
+        const manifest = restoreManifestSchema.parse(JSON.parse(sampleInput));
+        await verifyRestoreSamples(client, settings.SERVICE_NAME, manifest);
+        verifiedSamples = manifest.jobs.length + 1;
+      }
       const name = `restore-probe-${randomUUID()}`;
       queue = new Queue<TaskJobData, TaskResult, TaskType>(name, { connection: client });
       events = new QueueEvents(name, { connection: client });
@@ -283,6 +292,7 @@ const main = async (): Promise<void> => {
         taskCounts,
         auditCounts,
         documentProbe: 'completed',
+        ...(verifiedSamples === undefined ? {} : { verifiedSamples }),
       };
       process.stdout.write(`${JSON.stringify(report)}\n`);
       if (

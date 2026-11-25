@@ -1,6 +1,10 @@
 import type { Express } from 'express';
 import { createApp } from '../../src/app.js';
-import { createReadinessChecks, redisRateLimitStoreFactory } from '../../src/bootstrap.js';
+import {
+  createReadinessChecks,
+  redisRateLimitStoreFactory,
+  waitForRedisReady,
+} from '../../src/bootstrap.js';
 import { logger } from '../../src/config/logger.js';
 import { coordinationRedis, pingRedis, redis } from '../../src/config/redis.js';
 import {
@@ -25,14 +29,16 @@ export const createIntegrationAuditLog = (): AuditLog =>
 export const buildApp = (
   options: { auditLog?: AuditLog; isShuttingDown?: () => boolean } = {},
 ): Promise<Express> =>
-  createApp({
-    readinessChecks: createReadinessChecks({
-      isShuttingDown: options.isShuttingDown ?? (() => false),
-      pingRedis: () => pingRedis(1_000),
+  waitForRedisReady(coordinationRedis, 10_000).then(() =>
+    createApp({
+      readinessChecks: createReadinessChecks({
+        isShuttingDown: options.isShuttingDown ?? (() => false),
+        pingRedis: () => pingRedis(1_000),
+      }),
+      createRateLimitStore: redisRateLimitStoreFactory(coordinationRedis, SERVICE_NAME),
+      auditLog: options.auditLog ?? createIntegrationAuditLog(),
     }),
-    createRateLimitStore: redisRateLimitStoreFactory(coordinationRedis, SERVICE_NAME),
-    auditLog: options.auditLog ?? createIntegrationAuditLog(),
-  });
+  );
 
 /** Fresh state for every test: empty Redis database and zeroed metrics. */
 export const resetState = async (): Promise<void> => {

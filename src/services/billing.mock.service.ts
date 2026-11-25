@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { InvoiceTaskResult, ProcessInvoicePayload } from '../types/task.types.js';
+import type { RedisEffectStore } from './effect-idempotency.js';
 
 export class BillingServiceException extends Error {
   readonly statusCode = 503;
@@ -11,7 +12,11 @@ export class BillingServiceException extends Error {
 }
 
 export interface BillingGateway {
-  processInvoice(invoice: ProcessInvoicePayload, signal?: AbortSignal): Promise<InvoiceTaskResult>;
+  processInvoice(
+    invoice: ProcessInvoicePayload,
+    signal: AbortSignal | undefined,
+    idempotency: { key: string; fingerprint: string },
+  ): Promise<InvoiceTaskResult>;
 }
 
 export interface BillingMockOptions {
@@ -19,6 +24,7 @@ export interface BillingMockOptions {
   minLatencyMs?: number;
   maxLatencyMs?: number;
   random?: () => number;
+  store?: Pick<RedisEffectStore, 'applyMockPayment'>;
 }
 
 const abortReason = (signal?: AbortSignal): Error =>
@@ -46,17 +52,20 @@ export class BillingMockService implements BillingGateway {
   private readonly minLatencyMs: number;
   private readonly maxLatencyMs: number;
   private readonly random: () => number;
+  private readonly store: BillingMockOptions['store'];
 
   constructor(options: BillingMockOptions = {}) {
     this.failureRate = options.failureRate ?? 0.2;
     this.minLatencyMs = options.minLatencyMs ?? 1_500;
     this.maxLatencyMs = options.maxLatencyMs ?? 3_000;
     this.random = options.random ?? Math.random;
+    this.store = options.store;
   }
 
   async processInvoice(
     _invoice: ProcessInvoicePayload,
-    signal?: AbortSignal,
+    signal: AbortSignal | undefined,
+    idempotency: { key: string; fingerprint: string },
   ): Promise<InvoiceTaskResult> {
     const delayMs = this.minLatencyMs + this.random() * (this.maxLatencyMs - this.minLatencyMs);
     await abortableDelay(delayMs, signal);
@@ -66,12 +75,15 @@ export class BillingMockService implements BillingGateway {
     }
 
     const invoiceId = randomUUID();
-    return {
+    const result: InvoiceTaskResult = {
       taskType: 'PROCESS_INVOICE',
       invoiceId,
       status: 'PAID',
       pdfUrl: `https://billing.example.test/invoices/${invoiceId}.pdf`,
       processedAt: new Date().toISOString(),
     };
+    return this.store
+      ? this.store.applyMockPayment(idempotency.key, idempotency.fingerprint, result)
+      : result;
   }
 }

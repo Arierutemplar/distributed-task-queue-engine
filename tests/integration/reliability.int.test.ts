@@ -5,12 +5,44 @@ import { logger } from '../../src/config/logger.js';
 import { redis, coordinationRedis } from '../../src/config/redis.js';
 import { createAuditOutbox } from '../../src/observability/audit-outbox.js';
 import { createDlqReconciler } from '../../src/operations/dlq-reconciler.js';
+import {
+  captureRestoreSamples,
+  verifyRestoreSamples,
+} from '../../src/operations/restore-samples.js';
 import { taskQueue } from '../../src/queues/task.queue.js';
 import { deadLetterQueue, deadLetterJobId } from '../../src/queues/dead-letter.queue.js';
-import { closeConnections, resetState, waitFor } from './helpers.js';
+import { AUDIT_STREAM_KEY, closeConnections, resetState, waitFor } from './helpers.js';
+import { SERVICE_NAME } from './constants.js';
 
 beforeEach(resetState);
 afterAll(closeConnections);
+it('detects changed or missing sampled job and audit content', async () => {
+  const job = await taskQueue.add('PROCESS_DOCUMENT', {
+    type: 'PROCESS_DOCUMENT',
+    documentId: 'representative',
+    content: 'original',
+  });
+  if (!job.id) throw new Error('Expected job ID');
+  const auditId = await redis.xadd(AUDIT_STREAM_KEY, '*', 'record', '{"action":"test"}');
+  if (!auditId) throw new Error('Expected audit ID');
+  const manifest = await captureRestoreSamples(redis, SERVICE_NAME, {
+    jobs: [{ queue: 'tasks', id: job.id }],
+    auditId,
+  });
+  await expect(verifyRestoreSamples(redis, SERVICE_NAME, manifest)).resolves.toBeUndefined();
+  await job.updateData({
+    type: 'PROCESS_DOCUMENT',
+    documentId: 'representative',
+    content: 'changed',
+  });
+  await expect(verifyRestoreSamples(redis, SERVICE_NAME, manifest)).rejects.toThrow(
+    /does not match/u,
+  );
+  await redis.xdel(AUDIT_STREAM_KEY, auditId);
+  await expect(verifyRestoreSamples(redis, SERVICE_NAME, manifest)).rejects.toThrow(
+    /Missing sampled audit/u,
+  );
+});
 it('recovers an exhausted persisted audit after process restart and archive recovery', async () => {
   const settings = loadConfig({
     ...process.env,

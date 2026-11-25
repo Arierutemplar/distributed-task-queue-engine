@@ -105,6 +105,8 @@ describe('distributed tracing', () => {
       timeoutMs: 1_000,
       billing: { processInvoice: vi.fn() },
       billingCircuit: { execute: async (operation) => operation() },
+      effects: { begin: async () => undefined, complete: async (_key, _hash, result) => result },
+      effectNamespace: 'test',
     });
     const data = mocks.add.mock.calls[0]?.[1] as TaskJob['data'];
     const job = {
@@ -169,6 +171,8 @@ describe('distributed tracing', () => {
       logger: pino({ level: 'silent' }),
       timeoutMs: 1_000,
       billingCircuit: breaker,
+      effects: { begin: async () => undefined, complete: async (_key, _hash, result) => result },
+      effectNamespace: 'test',
       billing: {
         processInvoice: async () => ({
           taskType: 'PROCESS_INVOICE',

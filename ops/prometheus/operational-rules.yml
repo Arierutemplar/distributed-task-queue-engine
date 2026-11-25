@@ -6,61 +6,125 @@ groups:
       - record: task_queue:document_completion:p95_seconds
         expr: histogram_quantile(0.95, sum by (le, service) (rate(task_end_to_end_duration_seconds_bucket{task_type="PROCESS_DOCUMENT",outcome="completed"}[5m])))
       - alert: TaskQueueApiUnavailable
-        expr: up{job="task-queue-api"} == 0
+        expr: up{job="task-queue-api"} == 0 or absent(up{job="task-queue-api"})
         for: 1m
-        labels: { severity: critical }
+        labels: { severity: critical, owner: platform-oncall, team: platform }
         annotations:
-          { summary: 'API scrape unavailable; verify external TLS synthetic probe and readiness' }
+          {
+            summary: 'API scrape unavailable; verify external TLS synthetic probe and readiness',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-api-errors',
+          }
       - alert: TaskQueueApiErrorBudgetBurn
-        expr: sum by (service) (rate(http_request_duration_seconds_count{role="api",route=~"/api/v1/tasks.*",status_code=~"5.."}[5m])) / sum by (service) (rate(http_request_duration_seconds_count{role="api",route=~"/api/v1/tasks.*"}[5m])) > 0.0144
+        expr: sum by (service) (rate(http_request_duration_seconds_count{role=~"api|all",route=~"/api/v1/tasks.*",status_code=~"5.."}[5m])) / sum by (service) (rate(http_request_duration_seconds_count{role=~"api|all",route=~"/api/v1/tasks.*"}[5m])) > 0.0144
         for: 5m
-        labels: { severity: critical }
+        labels: { severity: critical, owner: platform-oncall, team: platform }
         annotations:
           {
             summary: 'API 5xx rate exceeds 14.4x the 99.9% error budget; not a monthly availability measurement',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-api-errors',
+          }
+      - alert: TaskQueueBacklogHigh
+        expr: max by (service) (sum by (service, instance) (queue_jobs{queue="tasks",state=~"waiting|paused|prioritized"})) > 100
+        for: 5m
+        labels: { severity: warning, owner: platform-oncall, team: platform }
+        annotations:
+          {
+            summary: 'Queue waiting backlog exceeds 100 jobs',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-queue-saturation',
+          }
+      - alert: TaskQueueBackpressure
+        expr: sum by (service) (increase(task_backpressure_rejections_total[5m])) > 0
+        labels: { severity: warning, owner: platform-oncall, team: platform }
+        annotations:
+          {
+            summary: 'Queue or tenant admissions are being rejected',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-queue-saturation',
+          }
+      - alert: TaskQueueBillingCircuitOpen
+        expr: max by (service, circuit) (circuit_breaker_state) == 2
+        for: 1m
+        labels: { severity: warning, owner: platform-oncall, team: platform }
+        annotations:
+          {
+            summary: 'A worker last observed an open circuit; verify shared state',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-circuit-and-dlq',
+          }
+      - alert: TaskQueueAttemptsFailed
+        expr: sum by (service) (increase(tasks_processed_total{outcome="failed"}[5m])) > 0
+        for: 2m
+        labels: { severity: warning, owner: platform-oncall, team: platform }
+        annotations:
+          {
+            summary: 'Task attempts are failing; inspect retries and DLQ',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-circuit-and-dlq',
           }
       - alert: TaskQueueAcceptanceLatency
         expr: task_queue:api_acceptance:p95_seconds > 0.5
         for: 5m
-        labels: { severity: warning }
-        annotations: { summary: 'Acceptance p95 above 500ms' }
+        labels: { severity: warning, owner: platform-oncall, team: platform }
+        annotations:
+          {
+            summary: 'Acceptance p95 above 500ms',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-queue-saturation',
+          }
       - alert: TaskQueueDocumentLatency
         expr: task_queue:document_completion:p95_seconds > 5
         for: 5m
-        labels: { severity: warning }
+        labels: { severity: warning, owner: platform-oncall, team: platform }
         annotations:
-          { summary: 'Successful document completion p95 above 5s; also inspect failures/backlog' }
+          {
+            summary: 'Successful document completion p95 above 5s; also inspect failures/backlog',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-queue-saturation',
+          }
       - alert: TaskQueueAuditEnqueueFailed
         expr: increase(audit_delivery_total{outcome="enqueue_failed"}[5m]) > 0
-        labels: { severity: critical }
+        labels: { severity: critical, owner: security-oncall, team: security }
         annotations:
-          { summary: 'Audit was not durably enqueued; recover logs/Redis audit and investigate' }
+          {
+            summary: 'Audit was not durably enqueued; recover logs/Redis audit and investigate',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-audit-delivery',
+          }
       - alert: TaskQueueAuditBacklog
         expr: audit_outbox_oldest_age_seconds > 300 or sum by (service) (audit_outbox_jobs{state="failed"}) > 0
         for: 2m
-        labels: { severity: warning }
+        labels: { severity: warning, owner: security-oncall, team: security }
         annotations:
-          { summary: 'Audit archival backlog; age samples pending state heads, not exhaustive' }
+          {
+            summary: 'Audit archival backlog; age samples pending state heads, not exhaustive',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-audit-delivery',
+          }
       - alert: TaskQueueMaintenanceStale
         expr: time() - maintenance_last_success_timestamp_seconds > 120
         for: 1m
-        labels: { severity: critical }
-        annotations: { summary: 'DLQ/audit reconciliation has not completed recently' }
+        labels: { severity: critical, owner: platform-oncall, team: platform }
+        annotations:
+          {
+            summary: 'DLQ/audit reconciliation has not completed recently',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-circuit-and-dlq',
+          }
       - alert: TaskQueueDlqNeedsReview
         expr: queue_jobs{queue="tasks-dead-letter",state="waiting"} > 0
         for: 5m
-        labels: { severity: warning }
+        labels: { severity: warning, owner: platform-oncall, team: platform }
         annotations:
           {
             summary: 'Terminal failures require operator triage; retained originals need managed cleanup',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-circuit-and-dlq',
           }
       - alert: TaskQueueBackupAtRisk
         expr: time() - backup_last_verified_timestamp_seconds > 600 or up{job="task-queue-backup"} == 0 or absent(up{job="task-queue-backup"})
         for: 1m
-        labels: { severity: critical }
+        labels: { severity: critical, owner: platform-oncall, team: platform }
         annotations:
-          { summary: 'Verified off-host backup is approaching/exceeding the 15 minute RPO' }
+          {
+            summary: 'Verified off-host backup is approaching/exceeding the 15 minute RPO',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-backup',
+          }
       - alert: TaskQueueBackupFailed
         expr: increase(backup_failures_total[5m]) > 0
-        labels: { severity: warning }
-        annotations: { summary: 'Backup capture/upload/remote verification failed' }
+        labels: { severity: warning, owner: platform-oncall, team: platform }
+        annotations:
+          {
+            summary: 'Backup capture/upload/remote verification failed',
+            runbook_url: 'https://github.com/Arierutemplar/distributed-task-queue-engine/blob/main/ops/OPERATIONS.md#alert-backup',
+          }

@@ -1,10 +1,11 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { SpanKind, trace } from '@opentelemetry/api';
 import { currentTraceContext, withSpan } from '../observability/tracing.js';
 import { deadLetterJobId, deadLetterQueue } from '../queues/dead-letter.queue.js';
 import { taskQueue } from '../queues/task.queue.js';
 import { addWithAdmission, type AdmissionLimits } from '../queues/admission.js';
 import { config } from '../config/env.js';
+import { payloadFingerprint } from './task-fingerprint.js';
 import {
   PUBLIC_TENANT_ID,
   type TaskAcceptedResponse,
@@ -28,6 +29,7 @@ export interface DispatchOptions {
   tenantId: string;
   idempotencyKey?: string;
   replayOf?: string;
+  effectId?: string;
   limits?: AdmissionLimits;
 }
 
@@ -38,11 +40,7 @@ export interface DispatchResult {
 
 const sha256 = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
 
-// Zod emits keys in schema order, so JSON.stringify of a parsed payload is deterministic.
-export const payloadFingerprint = (payload: TaskPayload): string => {
-  const { schemaVersion: _schemaVersion, ...versionOnePayload } = payload;
-  return sha256(JSON.stringify(versionOnePayload));
-};
+export { payloadFingerprint } from './task-fingerprint.js';
 
 // BullMQ custom ids may not contain ":" or be integers; a hex digest avoids both.
 // The tenant is part of the digest so two tenants can use the same key independently.
@@ -63,6 +61,9 @@ export const dispatchTask = async (
     SpanKind.PRODUCER,
     { 'request.id': options.requestId, 'tenant.id': options.tenantId, 'task.type': payload.type },
     async () => {
+      const jobId = options.idempotencyKey
+        ? idempotentJobId(options.tenantId, options.idempotencyKey)
+        : undefined;
       const meta: TaskJobMeta = {
         requestId: options.requestId,
         tenantId: options.tenantId,
@@ -70,11 +71,9 @@ export const dispatchTask = async (
         acceptedAt: new Date().toISOString(),
         ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
         ...(options.replayOf ? { replayOf: options.replayOf } : {}),
+        effectId: options.effectId ?? jobId ?? randomUUID(),
         ...currentTraceContext(),
       };
-      const jobId = options.idempotencyKey
-        ? idempotentJobId(options.tenantId, options.idempotencyKey)
-        : undefined;
 
       const limits = options.limits ?? config;
       const data = { ...payload, meta };

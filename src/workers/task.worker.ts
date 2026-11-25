@@ -14,6 +14,7 @@ import { addDeadLetter } from '../queues/dead-letter.queue.js';
 import { TASK_QUEUE_NAME } from '../queues/task.queue.js';
 import { RedisCircuitBreaker } from '../resilience/redis-circuit-breaker.js';
 import { BillingMockService, type BillingGateway } from '../services/billing.mock.service.js';
+import { RedisEffectStore } from '../services/effect-idempotency.js';
 import type { TaskJobData, TaskResult, TaskType } from '../types/task.types.js';
 import { createTaskProcessor, type TaskJob } from './task.processor.js';
 
@@ -97,10 +98,18 @@ export const createTaskWorker = (
     },
   });
 
+  const effects = new RedisEffectStore(
+    coordinationRedis,
+    config.SERVICE_NAME,
+    config.EFFECT_RETENTION_SECONDS,
+  );
   const processor = createTaskProcessor({
     billing:
-      options.billing ?? new BillingMockService({ failureRate: config.BILLING_FAILURE_RATE }),
+      options.billing ??
+      new BillingMockService({ failureRate: config.BILLING_FAILURE_RATE, store: effects }),
     billingCircuit,
+    effects,
+    effectNamespace: config.SERVICE_NAME,
     timeoutMs: config.JOB_TIMEOUT_MS,
     logger,
   });

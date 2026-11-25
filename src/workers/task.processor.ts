@@ -2,6 +2,8 @@ import { UnrecoverableError, type Job } from 'bullmq';
 import { SpanKind } from '@opentelemetry/api';
 import type { Logger } from 'pino';
 import type { BillingGateway } from '../services/billing.mock.service.js';
+import { effectKey, type RedisEffectStore } from '../services/effect-idempotency.js';
+import { payloadFingerprint } from '../services/task-fingerprint.js';
 import { processDocument } from '../services/document.service.js';
 import { withTimeout } from '../resilience/timeout.js';
 import { rememberJobAttempt, withJobSpan, withSpan } from '../observability/tracing.js';
@@ -10,6 +12,7 @@ import {
   type TaskJobData,
   type TaskResult,
   type TaskType,
+  PUBLIC_TENANT_ID,
 } from '../types/task.types.js';
 
 export type TaskJob = Job<TaskJobData, TaskResult, TaskType>;
@@ -17,6 +20,8 @@ export type TaskJob = Job<TaskJobData, TaskResult, TaskType>;
 export interface TaskProcessorDependencies {
   billing: BillingGateway;
   billingCircuit: { execute: <T>(operation: () => Promise<T>) => Promise<T> };
+  effects: Pick<RedisEffectStore, 'begin' | 'complete'>;
+  effectNamespace: string;
   timeoutMs: number;
   logger: Logger;
 }
@@ -69,18 +74,29 @@ export const createTaskProcessor =
             };
           }
           case 'PROCESS_INVOICE': {
+            const effectId = job.data.meta?.effectId ?? job.data.meta?.replayOf ?? job.id;
+            if (!effectId) throw new UnrecoverableError('Invoice task has no effect identity');
+            const key = effectKey(
+              dependencies.effectNamespace,
+              job.data.meta?.tenantId ?? PUBLIC_TENANT_ID,
+              effectId,
+            );
+            const fingerprint = payloadFingerprint(payload);
             log.info({ customerId: payload.customerId }, 'Invoice processing started');
             try {
+              const prior = await dependencies.effects.begin(key, fingerprint);
+              if (prior) return prior;
               const result = await dependencies.billingCircuit.execute(() =>
                 withSpan('billing.processInvoice', SpanKind.CLIENT, {}, () =>
-                  dependencies.billing.processInvoice(payload, signal),
+                  dependencies.billing.processInvoice(payload, signal, { key, fingerprint }),
                 ),
               );
+              const completed = await dependencies.effects.complete(key, fingerprint, result);
               log.info(
-                { customerId: payload.customerId, invoiceId: result.invoiceId },
+                { customerId: payload.customerId, invoiceId: completed.invoiceId },
                 'Invoice processed successfully',
               );
-              return result;
+              return completed;
             } catch (error: unknown) {
               log.warn(
                 { customerId: payload.customerId, err: error },

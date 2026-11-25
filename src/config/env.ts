@@ -86,6 +86,7 @@ export const envSchema = z
     SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(25_000),
     TASK_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(50).default(5),
     TASK_BACKOFF_DELAY_MS: z.coerce.number().int().min(10).max(600_000).default(2_000),
+    EFFECT_RETENTION_SECONDS: z.coerce.number().int().min(3_600).max(31_536_000).default(2_592_000),
 
     BILLING_FAILURE_RATE: z.coerce.number().min(0).max(1).default(0.2),
     CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce.number().int().min(1).max(1_000).default(5),

@@ -86,7 +86,13 @@ paths:
   /api/v1/tasks/process:
     post:
       summary: Enqueue a task
-      description: Reusing a key with the same payload and tenant returns the original acceptance; a different payload returns 409. Retention bounds idempotency.
+      description: |
+        Reusing a key with the same payload and tenant returns the original acceptance while the
+        job is retained; a different payload returns 409 in that window. Invoice effects use a
+        separate retained Redis record and stable provider key across worker retries and DLQ replay.
+        A later conflicting invoice may be accepted after job removal and then fail in the worker.
+        The local payment provider is simulated and shares Redis with the queue. Real providers
+        must durably deduplicate the same key; Redis cannot atomically commit an external effect.
       security:
         - ApiKey: []
       parameters:
@@ -102,7 +108,11 @@ paths:
               $ref: '#/components/schemas/TaskPayload'
       responses:
         '202':
-          description: Accepted or idempotently replayed
+          description: |
+            Accepted by the current Redis primary or idempotently replayed, not proof of execution,
+            external effect, fsync or replica acknowledgement. Asynchronous replication or a primary
+            crash can lose an acknowledged task or effect record. Reuse the same tenant and
+            Idempotency-Key on uncertain retries; no zero-loss or exactly-once guarantee is implied.
           headers:
             Location:
               schema: { type: string }

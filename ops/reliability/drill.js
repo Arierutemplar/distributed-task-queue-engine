@@ -229,6 +229,18 @@ try {
   compose('exec', '-T', 'backup', 'node', 'ops/reliability/probe.js', 'pause');
   if ((await api('/admin/api/dead-letter', true)).status !== 200)
     throw new Error('Cannot seed pending audit');
+  compose('stop', 'app');
+  const sample = json(
+    compose(
+      'exec',
+      '-T',
+      'backup',
+      'node',
+      'ops/reliability/probe.js',
+      'seed-sample',
+      unrouted.taskId,
+    ),
+  );
   const snapshot = json(
     compose('exec', '-T', 'backup', 'node', 'dist/src/operations/backup-cli.js', 'once'),
   );
@@ -236,6 +248,8 @@ try {
     compose(
       'exec',
       '-T',
+      '-e',
+      `RESTORE_SAMPLE_MANIFEST=${JSON.stringify(sample.manifest)}`,
       'backup',
       'node',
       'dist/src/operations/backup-cli.js',
@@ -248,7 +262,16 @@ try {
     throw new Error('Restore lost pending audit outbox');
   if (Object.values(restored.taskCounts).reduce((sum, count) => sum + count, 0) < 1)
     throw new Error('Restore lost task state');
-  reports.push(snapshot, restored);
+  if (restored.verifiedSamples !== 7) throw new Error('Restore did not verify every sample');
+  reports.push(
+    {
+      kind: 'representative-data-report',
+      states: sample.manifest.jobs.map((job) => job.state),
+      verifiedSamples: restored.verifiedSamples,
+    },
+    snapshot,
+    restored,
+  );
   const exportDirectory = exec(
     'backup',
     "import {mkdtemp} from 'node:fs/promises';process.stdout.write(await mkdtemp('/tmp/dtq-drill-export-'));",
