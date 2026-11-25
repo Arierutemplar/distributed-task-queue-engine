@@ -5,6 +5,7 @@ export type AuditAction =
   | 'admin.auth_failed'
   | 'admin.auth_locked'
   | 'admin.disabled'
+  | 'admin.access_denied'
   | 'admin.audit_read'
   | 'admin.bull_board_action'
   | 'dead_letter.list'
@@ -19,6 +20,8 @@ export interface AuditEvent {
   outcome: AuditOutcome;
   /** Authenticated admin username, or null when authentication did not succeed. */
   actor: string | null;
+  subject?: string | null;
+  role?: string | null;
   requestId: string;
   method: string;
   path: string;
@@ -40,6 +43,12 @@ export interface AuditLog {
   list: (limit: number) => Promise<AuditRecord[]>;
 }
 
+export interface AuditSink {
+  /** Archives one record; failures must be logged without rejecting the main audit flow. */
+  write: (record: AuditRecord) => Promise<void>;
+  close: () => Promise<void>;
+}
+
 export const AUDIT_STREAM_KEY_SUFFIX = 'audit:admin';
 
 export interface AuditLogOptions {
@@ -49,6 +58,7 @@ export interface AuditLogOptions {
   streamKey?: string;
   maxEntries?: number;
   now?: () => Date;
+  sink?: AuditSink;
 }
 
 /**
@@ -68,22 +78,24 @@ export const createAuditLog = (options: AuditLogOptions): AuditLog => {
       const record: AuditRecord = { timestamp: now().toISOString(), ...event };
       const level = record.outcome === 'success' ? 'info' : 'warn';
       log[level]({ event: record }, `audit ${record.action} ${record.outcome}`);
-      if (!persist) {
-        return;
+      // Start independently of Redis, including logs-only mode and Redis write failures.
+      const archived = options.sink?.write(record);
+      if (persist) {
+        try {
+          await persist.xadd(
+            streamKey,
+            'MAXLEN',
+            '~',
+            maxEntries,
+            '*',
+            'record',
+            JSON.stringify(record),
+          );
+        } catch (error: unknown) {
+          log.error({ err: error, action: record.action }, 'Failed to persist audit record');
+        }
       }
-      try {
-        await persist.xadd(
-          streamKey,
-          'MAXLEN',
-          '~',
-          maxEntries,
-          '*',
-          'record',
-          JSON.stringify(record),
-        );
-      } catch (error: unknown) {
-        log.error({ err: error, action: record.action }, 'Failed to persist audit record');
-      }
+      await archived;
     },
 
     async list(limit) {

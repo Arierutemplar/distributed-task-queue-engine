@@ -1,10 +1,13 @@
 # One deployable, three roles. The default stack runs PROCESS_ROLE=all (HTTP + worker).
 # The containers connect to the in-network Redis with REDIS_PASSWORD; REDIS_URL from .env is never used.
-# REDIS_PASSWORD and API_KEYS are required: set them in .env (see .env.example).
+# REDIS_PASSWORD is required for the Redis container; production API_KEYS are validated after env/Vault loading.
 #
 #   docker compose up --build                         # redis + app
 #   docker compose --profile scale-out up --build     # + dedicated worker-only container
 #   docker compose --profile observability up --build # + Collector, Jaeger, Prometheus and Grafana
+#   docker compose --profile compliance up --build    # + MinIO and Object Lock bucket initialization
+#   docker compose --profile secrets up --build       # + development OpenBao (enable vault mode explicitly)
+#   docker compose --profile ha-redis up --build      # + replica/Sentinels (configure Sentinel selectors)
 
 x-app-environment: &app-environment
   REDIS_URL: ''
@@ -27,6 +30,31 @@ x-app-environment: &app-environment
   OTEL_ENABLED: ${OTEL_ENABLED:-false}
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
   OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-}
+  SECRETS_PROVIDER: ${SECRETS_PROVIDER:-env}
+  VAULT_ADDR: ${VAULT_ADDR:-http://openbao:8200}
+  VAULT_AUTH_METHOD: ${VAULT_AUTH_METHOD:-token}
+  VAULT_TOKEN: ${VAULT_TOKEN:-}
+  VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}
+  VAULT_SECRET_ID: ${VAULT_SECRET_ID:-}
+  VAULT_APPROLE_PATH: ${VAULT_APPROLE_PATH:-approle}
+  VAULT_SECRET_PATH: ${VAULT_SECRET_PATH:-secret/data/task-queue}
+  VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
+  VAULT_TIMEOUT_MS: ${VAULT_TIMEOUT_MS:-5000}
+  REDIS_USERNAME: ${REDIS_USERNAME:-}
+  REDIS_SENTINEL_HOSTS: ${REDIS_SENTINEL_HOSTS:-}
+  REDIS_SENTINEL_MASTER_NAME: ${REDIS_SENTINEL_MASTER_NAME:-}
+  REDIS_SENTINEL_USERNAME: ${REDIS_SENTINEL_USERNAME:-}
+  REDIS_SENTINEL_PASSWORD: ${REDIS_SENTINEL_PASSWORD:-}
+  AUDIT_WORM_ENABLED: ${AUDIT_WORM_ENABLED:-false}
+  AUDIT_WORM_ENDPOINT: ${AUDIT_WORM_ENDPOINT-http://minio:9000}
+  AUDIT_WORM_REGION: ${AUDIT_WORM_REGION:-us-east-1}
+  AUDIT_WORM_BUCKET: ${AUDIT_WORM_BUCKET:-audit-worm}
+  AUDIT_WORM_ACCESS_KEY_ID: ${AUDIT_WORM_ACCESS_KEY_ID:-}
+  AUDIT_WORM_SECRET_ACCESS_KEY: ${AUDIT_WORM_SECRET_ACCESS_KEY:-}
+  AUDIT_WORM_FORCE_PATH_STYLE: ${AUDIT_WORM_FORCE_PATH_STYLE:-true}
+  AUDIT_WORM_LOCK_MODE: ${AUDIT_WORM_LOCK_MODE:-GOVERNANCE}
+  AUDIT_WORM_RETENTION_DAYS: ${AUDIT_WORM_RETENTION_DAYS:-30}
+  AUDIT_WORM_TIMEOUT_MS: ${AUDIT_WORM_TIMEOUT_MS:-5000}
 
 x-app-healthcheck: &app-healthcheck
   test:
@@ -38,6 +66,21 @@ x-app-healthcheck: &app-healthcheck
   timeout: 5s
   retries: 12
   start_period: 10s
+
+x-sentinel: &sentinel
+  profiles: ['ha-redis']
+  image: redis:7-alpine
+  command: ['sh', '/ops/sentinel.sh']
+  environment:
+    REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env (see .env.example)}
+    REDIS_SENTINEL_PASSWORD: ${REDIS_SENTINEL_PASSWORD:-}
+    REDIS_SENTINEL_MASTER_NAME: ${REDIS_SENTINEL_MASTER_NAME:-task-queue}
+  networks:
+    - queue-net
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
 
 services:
   redis:
@@ -52,6 +95,9 @@ services:
       - |
         exec redis-server - --appendonly yes --maxmemory-policy noeviction <<EOF
         requirepass $$REDIS_PASSWORD
+        masterauth $$REDIS_PASSWORD
+        replica-announce-ip $${REDIS_HA_NODE_IP:-redis}
+        replica-announce-port 6379
         EOF
     # Loopback only: reachable from this machine for host development, never from the network.
     ports:
@@ -78,9 +124,16 @@ services:
       <<: *app-environment
       PORT: '3000'
       PROCESS_ROLE: all
-      API_KEYS: ${API_KEYS:?Set API_KEYS in .env (see .env.example)}
+      API_KEYS: ${API_KEYS:-}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_AUTH_MODE: ${ADMIN_AUTH_MODE:-basic}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-http://keycloak:8080/realms/task-queue}
+      OIDC_PUBLIC_ISSUER_URL: ${OIDC_PUBLIC_ISSUER_URL:-http://localhost:8080/realms/task-queue}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-task-queue-admin}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-http://localhost:3000/admin/callback}
+      SESSION_SECRET: ${SESSION_SECRET:-}
       ADMIN_AUTH_MAX_FAILURES: ${ADMIN_AUTH_MAX_FAILURES:-10}
       ADMIN_AUTH_WINDOW_MS: ${ADMIN_AUTH_WINDOW_MS:-900000}
       AUDIT_LOG_MAX_ENTRIES: ${AUDIT_LOG_MAX_ENTRIES:-10000}
@@ -99,6 +152,139 @@ services:
     init: true
     stop_grace_period: 30s
     restart: unless-stopped
+
+  openbao:
+    profiles: ['secrets']
+    image: ghcr.io/openbao/openbao:2.4.4
+    command: ['server', '-dev', '-dev-listen-address=0.0.0.0:8200']
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN:-local-openbao-root-token}
+    ports:
+      - '127.0.0.1:8200:8200'
+    cap_add: ['IPC_LOCK']
+    networks:
+      - queue-net
+    restart: unless-stopped
+
+  openbao-init:
+    profiles: ['secrets']
+    image: ghcr.io/openbao/openbao:2.4.4
+    entrypoint: ['sh', '/ops/bootstrap.sh']
+    environment:
+      BAO_ADDR: http://openbao:8200
+      BAO_TOKEN: ${VAULT_DEV_ROOT_TOKEN:-local-openbao-root-token}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env (see .env.example)}
+      API_KEYS: ${API_KEYS:-local-openbao-api-key-0123456789abcdef}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      AUDIT_WORM_ACCESS_KEY_ID: ${AUDIT_WORM_ACCESS_KEY_ID:-}
+      AUDIT_WORM_SECRET_ACCESS_KEY: ${AUDIT_WORM_SECRET_ACCESS_KEY:-}
+      REDIS_SENTINEL_PASSWORD: ${REDIS_SENTINEL_PASSWORD:-}
+    volumes:
+      - ./ops/openbao/bootstrap.sh:/ops/bootstrap.sh:ro
+    depends_on:
+      openbao:
+        condition: service_started
+    networks:
+      - queue-net
+    restart: 'no'
+
+  redis-replica:
+    profiles: ['ha-redis']
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env (see .env.example)}
+    command:
+      - sh
+      - -c
+      - |
+        exec redis-server - --appendonly yes --maxmemory-policy noeviction <<EOF
+        replicaof $${REDIS_HA_PRIMARY_IP:-redis} 6379
+        replica-announce-ip $${REDIS_HA_NODE_IP:-redis-replica}
+        replica-announce-port 6379
+        masterauth $$REDIS_PASSWORD
+        requirepass $$REDIS_PASSWORD
+        EOF
+    volumes:
+      - redis_replica_data:/data
+    networks:
+      - queue-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis-sentinel-1:
+    <<: *sentinel
+    ports: ['127.0.0.1:26379:26379']
+    volumes:
+      - ./ops/redis/sentinel.sh:/ops/sentinel.sh:ro
+      - sentinel_1_data:/data
+
+  redis-sentinel-2:
+    <<: *sentinel
+    ports: ['127.0.0.1:26380:26379']
+    volumes:
+      - ./ops/redis/sentinel.sh:/ops/sentinel.sh:ro
+      - sentinel_2_data:/data
+
+  redis-sentinel-3:
+    <<: *sentinel
+    ports: ['127.0.0.1:26381:26379']
+    volumes:
+      - ./ops/redis/sentinel.sh:/ops/sentinel.sh:ro
+      - sentinel_3_data:/data
+
+  keycloak:
+    profiles: ['auth']
+    image: quay.io/keycloak/keycloak:26.4.7
+    command: ['start-dev', '--import-realm']
+    environment:
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: 'true'
+    ports:
+      - '127.0.0.1:8080:8080'
+    volumes:
+      - ./ops/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    networks:
+      - queue-net
+    restart: unless-stopped
+
+  minio:
+    profiles: ['compliance']
+    image: cgr.dev/chainguard/minio@sha256:3c60a2a8c4d33409a9bc7a623a7fcbfb4605adc3d89422d2f53b3f673a6e5597
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local-minio-root-change-me}
+    ports:
+      - '127.0.0.1:9000:9000'
+      - '127.0.0.1:9001:9001'
+    volumes:
+      - minio_data:/data
+    networks:
+      - queue-net
+    restart: unless-stopped
+
+  minio-init:
+    profiles: ['compliance']
+    build:
+      context: ./ops/minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local-minio-root-change-me}
+      AUDIT_WORM_BUCKET: ${AUDIT_WORM_BUCKET:-audit-worm}
+      AUDIT_WORM_ACCESS_KEY_ID: ${AUDIT_WORM_ACCESS_KEY_ID:-local-audit-writer}
+      AUDIT_WORM_SECRET_ACCESS_KEY: ${AUDIT_WORM_SECRET_ACCESS_KEY:-local-audit-writer-change-me}
+      AUDIT_WORM_LOCK_MODE: ${AUDIT_WORM_LOCK_MODE:-GOVERNANCE}
+      AUDIT_WORM_RETENTION_DAYS: ${AUDIT_WORM_RETENTION_DAYS:-30}
+    networks:
+      - queue-net
+    depends_on:
+      minio:
+        condition: service_started
+    restart: 'no'
 
   worker:
     profiles: ['scale-out']
@@ -188,3 +374,8 @@ networks:
 
 volumes:
   redis_data:
+  minio_data:
+  redis_replica_data:
+  sentinel_1_data:
+  sentinel_2_data:
+  sentinel_3_data:

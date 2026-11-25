@@ -16,6 +16,9 @@ describe('OpenAPI contract', () => {
         '/admin/api/dead-letter/{taskId}/replay',
         '/admin/api/dead-letter/{taskId}',
         '/admin/api/audit',
+        '/admin/login',
+        '/admin/callback',
+        '/admin/logout',
       ].sort(),
     );
   });

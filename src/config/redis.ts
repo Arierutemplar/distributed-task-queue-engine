@@ -1,6 +1,7 @@
 import { Redis, type RedisOptions } from 'ioredis';
 import { config } from './env.js';
 import { logger } from './logger.js';
+import { resolveRedisConnection } from './redis-options.js';
 
 const retryStrategy = (attempt: number): number => {
   const delayMs = Math.min(500 * 2 ** Math.min(attempt - 1, 6), 30_000);
@@ -15,14 +16,10 @@ const sharedOptions: RedisOptions = {
   connectionName: config.SERVICE_NAME,
 };
 
-export const redis = config.REDIS_URL
-  ? new Redis(config.REDIS_URL, sharedOptions)
-  : new Redis({
-      ...sharedOptions,
-      host: config.REDIS_HOST,
-      port: config.REDIS_PORT,
-      password: config.REDIS_PASSWORD,
-    });
+const connection = resolveRedisConnection(config, sharedOptions);
+export const redis = connection.url
+  ? new Redis(connection.url, connection.options)
+  : new Redis(connection.options);
 
 // Coordination commands must fail promptly rather than wait indefinitely in BullMQ's offline queue.
 export const coordinationRedis = redis.duplicate({

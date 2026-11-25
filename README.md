@@ -4,7 +4,7 @@ One Node.js deployable accepts background work over HTTP, stores it in Redis thr
 
 Redis is the only state. There is no second database and no separate message bus. The same image runs in one of three roles selected by `PROCESS_ROLE`: `all` (HTTP and worker in one process, the default), `api` (HTTP only), or `worker` (worker plus `/health` and `/metrics`). Scaling is horizontal at the process level: every worker instance consumes the same `tasks` queue, and every API instance shares the same Redis-backed rate limiter and idempotency keys.
 
-This repository is a working reference for that flow. The invoice handler is a mock that fails on purpose. The notification handler does not call an email provider. The task API is authenticated with per-tenant API keys (mandatory in production) and the admin surface with HTTP Basic auth.
+This repository is a working reference for that flow. The invoice handler is a mock that fails on purpose. The notification handler does not call an email provider. The task API is authenticated with per-tenant API keys (mandatory in production) and the admin surface with HTTP Basic auth by default, or optional Keycloak OIDC/SSO with admin/viewer RBAC.
 
 ## Key Architectural Highlights
 
@@ -25,7 +25,7 @@ This repository is a working reference for that flow. The invoice handler is a m
 | `SEND_NOTIFICATION` | email, subject, message                                    | `status: "processed"`          | Returns on the first attempt. No provider call                                               |
 | `PROCESS_INVOICE`   | customer, amount, currency, tax id, at least one line item | `PAID`, UUID, fake PDF URL     | Throws with probability `BILLING_FAILURE_RATE`; circuit breaker; retried, then dead-lettered |
 
-Redis is reached with `ioredis`. `REDIS_URL` (including `rediss://`) wins. Otherwise the client uses `REDIS_HOST`, `REDIS_PORT`, and `REDIS_PASSWORD`. `maxRetriesPerRequest` is `null`, which BullMQ requires for blocking commands. The reconnect delay is `min(500 * 2^min(attempt-1, 6), 30000)` milliseconds. Compose runs Redis with `maxmemory-policy noeviction`, which BullMQ requires: an evicted queue key is a lost job. The Compose Redis requires `REDIS_PASSWORD` (passed through stdin and `REDISCLI_AUTH`, so it never appears in a process list) and is published on `127.0.0.1` only.
+Redis is reached with `ioredis`. With Sentinel unset, `REDIS_URL` (including `rediss://`) wins. Otherwise the standalone client uses `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, and `REDIS_PASSWORD`. Setting both `REDIS_SENTINEL_HOSTS` and `REDIS_SENTINEL_MASTER_NAME` selects Sentinel instead, including for BullMQ's duplicated/blocking clients and Redis coordination. `maxRetriesPerRequest` is `null`, which BullMQ requires for blocking commands. The reconnect delay is `min(500 * 2^min(attempt-1, 6), 30000)` milliseconds. Compose runs Redis with `maxmemory-policy noeviction`, which BullMQ requires: an evicted queue key is a lost job. The Compose Redis requires `REDIS_PASSWORD` (passed through stdin and `REDISCLI_AUTH`, so it never appears in a process list) and is published on `127.0.0.1` only.
 
 Express disables `x-powered-by`, including on the Bull Board sub-app. The task API applies Helmet headers, CORS (`CORS_ORIGINS`), a rate limiter, API key authentication, and a 1 MB JSON limit, in that order. The limiter runs before authentication, so invalid keys are rate limited too. A missing or unknown API key returns `401`. Invalid JSON returns `400`. A body over 1 MB returns `413`. A Zod failure returns `400` with `issues`. A reused idempotency key with a different payload returns `409`. A queue failure returns `500`. Every response has an `X-Request-Id` header; some error bodies also include `requestId`.
 
@@ -106,7 +106,7 @@ The machine-readable contract is [openapi.yaml](./openapi.yaml), validated in th
 | `DELETE /admin/api/dead-letter/:taskId`      | Basic                     | Discard an entry; `204`                                                                        |
 | `GET /admin/api/audit?limit`                 | Basic                     | Newest admin audit records (1–1000, default 100)                                               |
 
-The admin surface returns `503` until `ADMIN_PASSWORD` (at least 12 characters) is configured, so a default deployment never exposes it anonymously. Credentials are compared in constant time. After `ADMIN_AUTH_MAX_FAILURES` rejected logins (default 10) from one client IP within `ADMIN_AUTH_WINDOW_MS` (default 15 minutes), every `/admin` request from that IP returns `429` until the window ends; successful requests, such as Bull Board's polling, are not counted. Only the `api` and `all` roles mount the task and admin routes.
+With `ADMIN_AUTH_MODE=basic` (default), the admin surface returns `503` until `ADMIN_PASSWORD` (at least 12 characters) is configured, so a default deployment never exposes it anonymously. Basic credentials are compared in constant time and grant the effective `admin` role. The table above describes this default; OIDC accepts Bearer tokens or browser sessions instead. After `ADMIN_AUTH_MAX_FAILURES` rejected logins (default 10) from one client IP within `ADMIN_AUTH_WINDOW_MS` (default 15 minutes), every `/admin` request from that IP returns `429` until the window ends; successful requests, such as Bull Board's polling, are not counted. Only the `api` and `all` roles mount the task and admin routes.
 
 **Admin audit trail.** Every sensitive admin action is recorded: dead-letter list, replay and delete (with outcome `success`, `not_found`, `invalid` or `error`), failed logins (`admin.auth_failed`), lockouts (`admin.auth_locked`), requests while the admin surface is disabled (`admin.disabled`), Bull Board write actions (`admin.bull_board_action`) and reads of the audit log itself. Each record has `timestamp`, `action`, `outcome`, `actor` (the authenticated admin user, or `null`), `requestId`, `method`, `path`, client `ip`, `statusCode` and, when relevant, `tenantId`, `taskId` and `newTaskId`. Passwords, `Authorization` headers, API keys and payloads are never recorded. Records are written as structured log lines with `audit: true` (ship them to your SIEM) and appended to the capped Redis stream `<SERVICE_NAME>:audit:admin` (`AUDIT_LOG_MAX_ENTRIES`, `0` = logs only), readable through `GET /admin/api/audit`. A Redis write failure is logged and never fails the admin request.
 
@@ -161,7 +161,7 @@ Node.js runtime metrics (event loop lag, heap, GC) are included. Successful `GET
 
 ## What Is Not Implemented
 
-There is no transactional outbox: the API writes to Redis only, so there is nothing to keep consistent with. API keys are static configuration: there is no self-service key issuance, no automatic expiry (rotate by adding the new key under the same tenant and removing the old one), and no admin RBAC/SSO beyond one Basic-auth operator. The idempotency window ends when BullMQ's retention removes the job. Results live only as long as that retention. Timeouts are per process; the circuit is shared in Redis and counts consecutive completions rather than failures in a rolling time window. The dead-letter copy is not atomic with the failure (see above). The audit stream is capped and lives in the same Redis; for tamper-evident, long-term retention ship the `audit: true` log lines to external storage. The billing service is a mock and notifications are not sent. Redis Sentinel/Cluster, a secrets manager, immutable SIEM export and Helm/Kubernetes manifests remain future work.
+There is no transactional outbox: task acceptance writes to Redis only. Optional WORM audit archival is best-effort, not an atomic dual write with Redis. API keys are startup configuration: there is no self-service issuance or automatic expiry (rotate by adding the new key under the same tenant and removing the old one). Vault/AppRole secrets are loaded once, without live rotation or token renewal. Sentinel restores access to a promoted replica, but asynchronous replication can lose acknowledged writes and is not a zero-data-loss guarantee. OIDC sessions end at access-token expiry, without refresh or immediate token revocation checks. The idempotency window ends when BullMQ's retention removes the job. Results live only as long as that retention. Timeouts are per process; the circuit is shared in Redis and counts consecutive completions rather than failures in a rolling time window. The dead-letter copy is not atomic with the failure (see above). The audit stream is capped and lives in the same Redis; optional S3 Object Lock protects successfully archived object versions, but there is no automatic retry/backfill or cryptographic audit chain. The billing service is a mock and notifications are not sent. Redis Cluster and Helm/Kubernetes manifests remain future work.
 
 ## Testing Strategy
 
@@ -222,7 +222,7 @@ Requirements: Node.js 22 for the host toolchain, and Docker Engine with Compose 
 
 ### Docker Compose
 
-Copy `.env.example` to `.env` and set at least `REDIS_PASSWORD`, `API_KEYS`, and `ADMIN_PASSWORD` (Compose refuses to start without the first two). Generate each value with:
+Copy `.env.example` to `.env` and set at least `REDIS_PASSWORD`, `API_KEYS`, and `ADMIN_PASSWORD`. Compose requires the Redis server password; the production app validates API keys after env/Vault loading. Generate each value with:
 
 ```bash
 node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
@@ -285,7 +285,7 @@ npm install
 npm run check      # lint + format check + typecheck + unit tests with coverage
 ```
 
-Copy `.env.example` to `.env`. **`REDIS_URL` vs `REDIS_PASSWORD`:** inside Docker Compose the containers always use the in-network Redis with `REDIS_PASSWORD` and ignore `REDIS_URL`. On the host, `REDIS_URL` wins when it is set: leave it empty to use the Compose Redis (`docker compose up redis`, published on `127.0.0.1:${REDIS_PORT:-6379}` and authenticated with the same `REDIS_PASSWORD`), or set it to reach another Redis (for example a managed `rediss://` instance). The same `.env` serves both, as long as `REDIS_URL` is empty when you want the Compose Redis.
+Copy `.env.example` to `.env`. **`REDIS_URL` vs `REDIS_PASSWORD`:** default Docker Compose blanks `REDIS_URL` and uses its in-network Redis. A Vault secret may supply a runtime URL, and explicitly configured Sentinel takes precedence over any URL. On the host without Sentinel, `REDIS_URL` wins when set: leave it empty to use the Compose Redis (`docker compose up redis`, published on `127.0.0.1:${REDIS_PORT:-6379}` and authenticated with the same `REDIS_PASSWORD`), or set it to reach another Redis (for example a managed `rediss://` instance). The same `.env` serves both, as long as `REDIS_URL` is empty when you want the Compose Redis.
 
 To rotate a legacy (plain) API key without losing its tasks, compute its tenant id and map the new key to it:
 
@@ -316,6 +316,424 @@ curl -s -H "X-API-Key: <one of API_KEYS>" http://localhost:3000/api/v1/tasks/<ta
 Expect `202` with `taskId`, `taskType`, `status: "accepted"`, `acceptedAt`, and a `Location` header. Repeating the first request returns the same `taskId` with `Idempotent-Replayed: true`. An invoice body uses `customerId`, a positive `amount`, `currency`, `taxId`, and a non-empty `items` array of `description`, positive integer `quantity`, and positive `unitPrice`. A notification body uses `recipient` (email), `subject`, and `message`.
 
 Open `http://localhost:3000/admin/queues` with the admin credentials to see both queues. Put it behind TLS before exposing it beyond localhost; Basic auth sends the password on every request.
+
+### Optional Keycloak OIDC / SSO and RBAC
+
+`docker compose up -d` remains unchanged: Keycloak is opt-in under `--profile auth`,
+and `ADMIN_AUTH_MODE=basic` remains the default. In `oidc` mode Basic is not accepted.
+Start the local imported realm without editing your existing `.env` (PowerShell):
+
+```powershell
+$env:ADMIN_AUTH_MODE = 'oidc'
+$env:OIDC_ISSUER_URL = 'http://keycloak:8080/realms/task-queue'
+$env:OIDC_PUBLIC_ISSUER_URL = 'http://localhost:8080/realms/task-queue'
+$env:OIDC_CLIENT_ID = 'task-queue-admin'
+$env:OIDC_CLIENT_SECRET = ''
+$env:OIDC_REDIRECT_URI = 'http://localhost:3000/admin/callback'
+$env:SESSION_SECRET = (node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")
+docker compose --profile auth up -d --build
+curl.exe --retry 30 --retry-delay 2 --retry-all-errors --fail http://localhost:8080/realms/task-queue/.well-known/openid-configuration
+Start-Process 'http://localhost:3000/admin/login'
+```
+
+Imported **development-only** users: `admin` / `local-admin-change-me` and
+`viewer` / `local-viewer-change-me`. Login redirects to `/admin/queues`; use
+`http://localhost:3000/admin/logout` to clear the app session and redirect to
+Keycloak logout (confirm SSO logout if prompted) before switching users.
+The profile binds Keycloak to loopback on port 8080, uses `start-dev --import-realm`,
+and has no persistent Keycloak volume; recreating its container resets local users.
+Local HTTP URLs are permitted even though the app image uses `NODE_ENV=production`;
+non-local URLs must use HTTPS. Do not expose this demo as a production SSO deployment.
+
+| Variable                 | Meaning                                                                                                                  |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `ADMIN_AUTH_MODE`        | `basic` (default) or `oidc`; no automatic fallback on OIDC failures                                                      |
+| `OIDC_ISSUER_URL`        | Internal Keycloak realm URL for JWKS and code exchange; for a host process use `http://localhost:8080/realms/task-queue` |
+| `OIDC_PUBLIC_ISSUER_URL` | Exact token issuer and browser-facing realm URL; defaults to `OIDC_ISSUER_URL`                                           |
+| `OIDC_CLIENT_ID`         | Client and required JWT audience; default `task-queue-admin`                                                             |
+| `OIDC_CLIENT_SECRET`     | Confidential client secret; blank for the imported public PKCE client                                                    |
+| `OIDC_REDIRECT_URI`      | Exact registered callback, locally `http://localhost:3000/admin/callback`                                                |
+| `SESSION_SECRET`         | Required 32+ random characters, identical across API replicas; rotation invalidates all app sessions                     |
+
+JWTs are verified with `jose` and cached/rotating remote JWKS, RS256 signature,
+issuer, audience, subject, issued-at and expiration. Roles come from
+`realm_access.roles` or `resource_access.<OIDC_CLIENT_ID>.roles`; `admin` wins if
+both are present. Missing roles give `403`. `viewer` may read the board, DLQ and
+audit API, but every `POST`, `DELETE`, `PUT`, `PATCH` (and other non-read methods)
+under protected `/admin` routes returns `403` before execution.
+`admin` retains existing write access, including Bull Board actions on the task
+queue and DLQ replay/delete APIs; the DLQ remains read-only **in Bull Board** as before.
+Denials use audit action `admin.access_denied`. All administrative audit events
+also include `subject` (`sub` or Basic username) and effective `role`, alongside
+`actor` (`preferred_username`, falling back to `sub`).
+
+Browser login uses Authorization Code + S256 PKCE, encrypted ten-minute state/
+verifier/nonce transaction cookies, and validates the returned ID-token nonce.
+The session cookie is encrypted, `HttpOnly`, `SameSite=Lax`, scoped to `/admin`,
+and `Secure` with HTTPS (`__Secure-admin_session`). Only local development HTTP
+uses `admin_session` without Secure. Each request revalidates the access token;
+sessions expire with it (five minutes in the local realm) and require a new login.
+No refresh tokens are stored. Cookie-authenticated writes must send the app's
+exact `Origin`; Bearer calls do not use this cookie-CSRF check.
+Logging redacts cookies and authorization headers and omits callback query
+parameters. Stateless cookies can be replayed until expiration if stolen;
+logout clears the browser cookie, but does not revoke previously issued Bearer tokens.
+
+API permission checks (PowerShell, no browser/cookies needed):
+
+```powershell
+$tokenUrl = 'http://localhost:8080/realms/task-queue/protocol/openid-connect/token'
+$viewerToken = (Invoke-RestMethod -Method Post -Uri $tokenUrl -Body @{
+  grant_type='password'; client_id='task-queue-admin'
+  username='viewer'; password='local-viewer-change-me'
+}).access_token
+$adminToken = (Invoke-RestMethod -Method Post -Uri $tokenUrl -Body @{
+  grant_type='password'; client_id='task-queue-admin'
+  username='admin'; password='local-admin-change-me'
+}).access_token
+curl.exe -i -H "Authorization: Bearer $viewerToken" http://localhost:3000/admin/api/dead-letter
+curl.exe -i -H "Authorization: Bearer $viewerToken" http://localhost:3000/admin/api/audit
+curl.exe -i -X POST -H "Authorization: Bearer $viewerToken" http://localhost:3000/admin/api/dead-letter/demo/replay
+curl.exe -i -X DELETE -H "Authorization: Bearer $viewerToken" http://localhost:3000/admin/api/dead-letter/demo
+curl.exe -i -X POST -H "Authorization: Bearer $adminToken" http://localhost:3000/admin/api/dead-letter/demo/replay
+curl.exe -i -X DELETE -H "Authorization: Bearer $adminToken" http://localhost:3000/admin/api/dead-letter/demo
+curl.exe -i -H "Authorization: Bearer $adminToken" http://localhost:3000/admin/api/audit
+```
+
+Viewer GETs return `200`; writes return `403` even if `demo` does not exist.
+Admin writes return `404` for this missing entry, demonstrating that authorization
+passed; use a real DLQ task ID for `202` replay / `204` delete (different entries,
+because replay removes the original). Invalid/expired tokens return `401`.
+Password grants above exist **only for local testing**; production should disable
+direct access grants, replace demo accounts/passwords, use a confidential client
+with PKCE and managed Keycloak, and require HTTPS for all OIDC URLs. This local
+profile fixes Keycloak's hostname to `http://localhost:8080`; other deployments
+must configure their own hostname and exact redirect/logout URIs.
+
+To return the app to Basic without changing `.env`:
+
+```powershell
+$env:ADMIN_AUTH_MODE = 'basic'
+docker compose up -d --build app
+docker compose --profile auth stop keycloak
+# ADMIN_PASSWORD from your existing .env is used again.
+```
+
+`npm run ci` needs no external Keycloak. OIDC unit tests serve in-memory RSA JWKS
+and exercise JWT rejection, PKCE/session login and cookie CSRF; integration tests
+use the same local-key approach against real Redis/BullMQ, including viewer
+denials, admin replay/delete/Bull Board mutation and persisted audit identity.
+
+### Optional immutable audit archive: MinIO / S3 Object Lock
+
+`AUDIT_WORM_ENABLED=false` preserves Redis/log auditing and the default
+`docker compose up -d` stack. `--profile compliance` adds MinIO (API
+`http://localhost:9000`, console `http://localhost:9001`) and a one-shot
+`minio-init` container. Both MinIO/mc binaries use pinned Chainguard image digests;
+the init image adds a shell using the same Node Alpine base as the app because
+the mc distribution is distroless. It creates a versioned bucket with Object
+Lock, configures default retention, and provisions a restricted writer with
+`s3:PutObject` / `s3:PutObjectRetention`, but **no delete or governance-bypass
+permissions**. Re-running initialization is idempotent. An existing bucket
+without Object Lock is rejected; use a new bucket rather than silently accepting
+an unlocked destination.
+
+Start the local profile without editing your existing `.env` (PowerShell):
+
+```powershell
+$env:AUDIT_WORM_ENABLED = 'true'
+$env:AUDIT_WORM_ENDPOINT = 'http://minio:9000'
+$env:AUDIT_WORM_REGION = 'us-east-1'
+$env:AUDIT_WORM_BUCKET = 'audit-worm'
+$env:AUDIT_WORM_ACCESS_KEY_ID = 'local-audit-writer'
+$env:AUDIT_WORM_SECRET_ACCESS_KEY = 'local-audit-writer-change-me'
+$env:AUDIT_WORM_FORCE_PATH_STYLE = 'true'
+$env:AUDIT_WORM_LOCK_MODE = 'GOVERNANCE' # Or COMPLIANCE
+$env:AUDIT_WORM_RETENTION_DAYS = '30'
+$env:AUDIT_WORM_TIMEOUT_MS = '5000'
+
+docker compose --profile compliance up -d --build minio-init
+docker compose --profile compliance wait minio-init
+# Continue only if initialization completed with exit code 0:
+if ($LASTEXITCODE -eq 0) { docker compose --profile compliance up -d --build app }
+```
+
+The root administration defaults are `minioadmin` /
+`local-minio-root-change-me`, configured by `MINIO_ROOT_USER` /
+`MINIO_ROOT_PASSWORD`. These and the writer credentials above are **local-only
+examples**: change them for any non-local deployment, use TLS, restrict network
+access, and keep root/bypass credentials out of the application. The app receives
+only writer credentials. MinIO data persists in `minio_data`.
+The `auth` and `compliance` profiles can be combined with
+`docker compose --profile auth --profile compliance up -d --build`.
+
+| Variable                                                    | Default / behavior                                                                              |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `AUDIT_WORM_ENABLED`                                        | `false`; incomplete writer credentials log a warning and keep Redis/logs only                   |
+| `AUDIT_WORM_ENDPOINT`                                       | Compose: `http://minio:9000`; host process: `http://localhost:9000`; empty uses AWS regional S3 |
+| `AUDIT_WORM_REGION`                                         | `us-east-1`                                                                                     |
+| `AUDIT_WORM_BUCKET`                                         | `audit-worm`; must already have Object Lock/versioning when using external S3                   |
+| `AUDIT_WORM_ACCESS_KEY_ID` / `AUDIT_WORM_SECRET_ACCESS_KEY` | Both required to activate archival; no implicit SDK credential-provider fallback                |
+| `AUDIT_WORM_FORCE_PATH_STYLE`                               | `true`, compatible with local MinIO                                                             |
+| `AUDIT_WORM_LOCK_MODE`                                      | `GOVERNANCE` or `COMPLIANCE`; default `GOVERNANCE`                                              |
+| `AUDIT_WORM_RETENTION_DAYS`                                 | `30`; 1–36500 days, each day is 24 hours from archival time                                     |
+| `AUDIT_WORM_TIMEOUT_MS`                                     | `5000`; one attempt per event, aborted on timeout; keep below `SHUTDOWN_TIMEOUT_MS`             |
+| `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`                   | Local MinIO administration only; not application archive credentials                            |
+
+Each existing **administrative audit event** is also exported as one JSON object
+under `<encoded SERVICE_NAME>/<YYYY-MM-DD>/<random UUID>.json`, preserving
+timestamp, action, outcome, actor, subject/role and request context. These are not
+copies of arbitrary worker/application logs or historical Redis events.
+Every PUT supplies a SHA-256 checksum, explicit Object Lock mode and
+`RetainUntilDate`. Success requires a non-null version ID. Separate
+`auditWorm: true` log lines record success/failure and object/version identifiers
+without raw SDK errors or credentials. Redis persistence and archival start
+independently, including logs-only mode and Redis write failures.
+
+Admin handlers await the bounded archive attempt; an archive failure may add up
+to the configured timeout but never changes the HTTP result. Normal shutdown
+drains pending archive writes before closing the S3 client. There is no automatic
+retry, durable archive queue or backfill: destination failures leave the event in
+the existing Redis/log path where available. Monitor `WORM audit write failed`
+and forward structured logs to your SIEM if you need guaranteed recovery.
+`GET /admin/api/audit` continues to read Redis, not the archive.
+
+Generate an event with your existing Basic credentials (curl prompts for
+`ADMIN_PASSWORD`; replace `admin` if `ADMIN_USERNAME` differs), or use an OIDC
+Bearer token as documented above:
+
+```powershell
+curl.exe -i --user admin http://localhost:3000/admin/api/dead-letter
+docker compose logs --tail 30 app
+```
+
+Inspect and test **a specific immutable version** with mc:
+
+```powershell
+$listing = docker compose --profile compliance run --rm --no-deps -T --entrypoint /bin/sh minio-init -c 'mc alias set archive http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; mc ls --recursive --versions --json "archive/$AUDIT_WORM_BUCKET"'
+$object = $listing | ForEach-Object { $_ | ConvertFrom-Json } |
+  Where-Object { $_.type -eq 'file' } | Select-Object -First 1
+if (-not $object) { throw 'No archived audit object found' }
+$env:WORM_TEST_KEY = $object.key
+$env:WORM_TEST_VERSION = $object.versionId
+
+docker compose --profile compliance run --rm --no-deps -T -e WORM_TEST_KEY -e WORM_TEST_VERSION --entrypoint /bin/sh minio-init -c 'mc alias set archive http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; mc retention info --version-id "$WORM_TEST_VERSION" "archive/$AUDIT_WORM_BUCKET/$WORM_TEST_KEY"; mc stat --version-id "$WORM_TEST_VERSION" "archive/$AUDIT_WORM_BUCKET/$WORM_TEST_KEY"'
+# Must fail before retention expiry (AccessDenied / WORM protected):
+docker compose --profile compliance run --rm --no-deps -T -e WORM_TEST_KEY -e WORM_TEST_VERSION --entrypoint /bin/sh minio-init -c 'mc alias set archive http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; mc rm --version-id "$WORM_TEST_VERSION" "archive/$AUDIT_WORM_BUCKET/$WORM_TEST_KEY"'
+```
+
+Do **not** add `--bypass` to the deletion check. GOVERNANCE allows authorized
+administrators to bypass retention; COMPLIANCE prevents deletion/shortening even
+by the S3 root user until expiry (retention may be extended). Object Lock protects
+versions: a DELETE without a version ID can create a delete marker, and another
+PUT can create a new version without modifying the archived one. Verify the
+original version, not merely the latest key.
+This is S3-level protection, **not** protection from someone deleting the Docker
+volume or its host files. Never remove `minio_data` for an archive you must retain;
+use durable, appropriately managed storage for real compliance obligations.
+
+To disable new archival without changing `.env` or deleting archived objects:
+
+```powershell
+$env:AUDIT_WORM_ENABLED = 'false'
+docker compose up -d --build app
+```
+
+`npm run ci` requires no MinIO: unit tests use a fake S3 client to verify both lock
+modes, exact retention/checksum, disabled/unconfigured behavior, safe failures and
+timeout/drain behavior. Integration tests exercise actual admin HTTP routes and
+Redis alongside the fake S3 client.
+
+### Optional runtime secrets: OpenBao / Vault KV v2
+
+`SECRETS_PROVIDER=env` is the default. The entry point loads dotenv once, then
+optionally fetches Vault secrets **before** config validation, Redis connections,
+workers or HTTP listeners are created. Vault is authoritative for the sensitive
+keys it returns; absent keys retain their environment values. Only
+`REDIS_URL`, `REDIS_USERNAME`, `REDIS_PASSWORD`, `REDIS_SENTINEL_USERNAME`,
+`REDIS_SENTINEL_PASSWORD`, `API_KEYS`, `ADMIN_PASSWORD`, `OIDC_CLIENT_SECRET`,
+`SESSION_SECRET`, `AUDIT_WORM_ACCESS_KEY_ID` and `AUDIT_WORM_SECRET_ACCESS_KEY`
+can be injected. Unrelated settings such as `PORT` cannot be changed by the secret.
+Values are applied atomically after validating the KV v2 response and are never
+logged or written to `.env` files.
+
+| Variable                            | Meaning                                                                                                                |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `SECRETS_PROVIDER`                  | `env` (default) or `vault`, for all process roles                                                                      |
+| `VAULT_ADDR`                        | Vault-compatible server URL; Compose `http://openbao:8200`, host `http://localhost:8200`; non-local URLs require HTTPS |
+| `VAULT_AUTH_METHOD`                 | `token` (default) or `approle`                                                                                         |
+| `VAULT_TOKEN`                       | Required in token mode; use a least-privileged KV read token in production                                             |
+| `VAULT_ROLE_ID` / `VAULT_SECRET_ID` | Both required for AppRole login                                                                                        |
+| `VAULT_APPROLE_PATH`                | Auth mount path; default `approle`, login at `/v1/auth/<mount>/login`                                                  |
+| `VAULT_SECRET_PATH`                 | Required KV v2 HTTP path `<mount>/data/<secret>`, not the CLI path; example `secret/data/task-queue`                   |
+| `VAULT_NAMESPACE`                   | Optional `X-Vault-Namespace` header                                                                                    |
+| `VAULT_TIMEOUT_MS`                  | `5000`, bounded per login/read request                                                                                 |
+| `VAULT_DEV_ROOT_TOKEN`              | Local OpenBao profile only; default `local-openbao-root-token`                                                         |
+
+Missing credentials/address/path, rejected tokens, unavailable storage, timeout,
+wrong KV versions, empty secrets or non-string sensitive values abort startup
+with exit code 1 and sanitized diagnostics. There is **no fallback to env mode**
+after a Vault failure. Final app configuration is also validated before clients
+are created. Secrets are loaded only at startup; rotate credentials by updating
+Vault and restarting all API/worker replicas. Token renewal and live reload are
+not implemented. Preserve tenant IDs when rotating API keys.
+
+The optional `secrets` profile runs OpenBao in **development mode**: in-memory
+storage, loopback port 8200, a known root token which the dev server prints, and
+no production seal/storage/HA configuration. Do not expose it as a production
+secret store. Its one-shot initializer seeds `secret/task-queue` from the Redis
+server password and configured API/admin/OIDC/WORM credentials. Existing secret
+values are retained on subsequent initialization. If API keys were not supplied,
+the initializer uses the **local-only** demonstration key
+`local-openbao-api-key-0123456789abcdef`. The Redis container still needs
+`REDIS_PASSWORD` from the existing environment; the Vault value must match it.
+
+PowerShell, without changing your local `.env`:
+
+```powershell
+docker compose --profile secrets up -d openbao-init
+docker compose --profile secrets wait openbao-init
+if ($LASTEXITCODE -ne 0) { throw 'OpenBao initialization failed' }
+$env:SECRETS_PROVIDER = 'vault'
+$env:VAULT_ADDR = 'http://openbao:8200'
+$env:VAULT_AUTH_METHOD = 'token'
+$env:VAULT_TOKEN = 'local-openbao-root-token'
+$env:VAULT_SECRET_PATH = 'secret/data/task-queue'
+# Demonstrate completion from Vault instead of requiring API_KEYS in the app environment:
+$env:API_KEYS = ''
+docker compose --profile secrets up -d --build app
+docker compose logs --tail 30 app
+curl.exe --fail http://localhost:3000/health/ready
+```
+
+The log `Runtime secrets loaded` lists **key names only**, not values. API keys
+are deliberately validated at runtime after loading, rather than by Compose's
+interpolation, so Vault can fill an empty `API_KEYS`. The default `env` production
+mode still refuses to serve the API without valid keys.
+Verify KV metadata without dumping secret values:
+
+```powershell
+docker compose --profile secrets run --rm --no-deps -T --entrypoint bao openbao-init kv metadata get secret/task-queue
+```
+
+For AppRole, create a role in your managed Vault/OpenBao with a policy granting
+`read` only on the configured KV data path, then supply its credentials:
+
+```powershell
+$env:VAULT_AUTH_METHOD = 'approle'
+$env:VAULT_ROLE_ID = '<role-id>'
+$env:VAULT_SECRET_ID = '<secret-id>'
+$env:VAULT_TOKEN = ''
+docker compose --profile secrets up -d --build app
+```
+
+For a **fresh local demo** only, these commands provision the read-only role and
+capture the IDs without printing them (do not enable an already mounted AppRole
+backend again):
+
+```powershell
+$bao = @('--profile', 'secrets', 'run', '--rm', '--no-deps', '-T', '--entrypoint', 'bao', 'openbao-init')
+docker compose @bao auth enable approle
+'path "secret/data/task-queue" { capabilities = ["read"] }' | docker compose @bao policy write task-queue-app -
+docker compose @bao write auth/approle/role/task-queue token_policies=task-queue-app token_type=batch token_ttl=10m secret_id_ttl=1h
+$env:VAULT_ROLE_ID = [string](docker compose @bao read -field=role_id auth/approle/role/task-queue/role-id)
+$env:VAULT_SECRET_ID = [string](docker compose @bao write -f -field=secret_id auth/approle/role/task-queue/secret-id)
+$env:VAULT_AUTH_METHOD = 'approle'
+$env:VAULT_TOKEN = ''
+docker compose --profile secrets up -d --build app
+```
+
+The login token remains in memory only for the KV read. For host development,
+use `VAULT_ADDR=http://localhost:8200` and your normal host Redis address before
+`npm run dev`. Worker-only and scale-out processes use the same loader.
+To return to `env`, restore a valid `API_KEYS` in the shell (or remove the empty
+shell override so the existing `.env` supplies it), set `SECRETS_PROVIDER=env`,
+and recreate the app. Do not remove server data to switch secret providers.
+
+### Optional Redis HA: Sentinel
+
+`--profile ha-redis` adds a replica and three Sentinels (quorum 2) to the default
+Redis primary. All data nodes use authentication, AOF and `noeviction`. The
+Sentinels retain rewritten configuration in separate volumes, resolve Docker
+hostnames, detect a down primary after 5 seconds, and promote the replica.
+The app, worker/blocking BullMQ clients, audit stream, shared circuit and rate
+limits use the discovered master; there is no silent standalone fallback.
+For reproducible container-stop failover, use the optional
+[HA overlay](./docker-compose.ha.yml). It assigns stable private IPs to both
+data nodes, without altering the default Compose network. This avoids blocking
+DNS resolution of Docker aliases which disappear when a container stops:
+slow upstream DNS can otherwise put Sentinel into TILT and delay promotion.
+The overlay defaults to `REDIS_HA_SUBNET=172.30.0.0/24`,
+`REDIS_HA_PRIMARY_IP=172.30.0.10`, `REDIS_HA_REPLICA_IP=172.30.0.11`; choose
+a non-conflicting subnet and update both addresses together if needed.
+
+| Variable                                              | Meaning                                                                         |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `REDIS_SENTINEL_HOSTS`                                | Comma-separated `host:port`; IPv6 uses `[address]:port`                         |
+| `REDIS_SENTINEL_MASTER_NAME`                          | Monitored master name; set together with hosts                                  |
+| `REDIS_USERNAME` / `REDIS_PASSWORD`                   | Data-plane Redis credentials; default demo uses password only                   |
+| `REDIS_SENTINEL_USERNAME` / `REDIS_SENTINEL_PASSWORD` | Separate Sentinel credentials; leave username empty for the demo's default user |
+
+Both Sentinel selector fields default to empty, preserving standalone URL/host
+behavior. When configured, they override `REDIS_URL`. Sentinel unreachable at
+startup fails the existing bounded readiness ping instead of using another
+database. Coordination keeps its one-second command timeout and no offline
+queue; existing fail-open rate-limit behavior remains unchanged. Sentinel startup
+also waits (bounded to 10 seconds) for the independently resolved coordination
+connection before initializing shared rate-limit scripts.
+
+For an independent HA demo, use a fresh PowerShell session with your existing
+env API/admin credentials (or combine this with the `secrets` profile). The
+separate project and host ports below preserve your current stack and its data:
+
+```powershell
+$env:REDIS_SENTINEL_HOSTS = 'redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379'
+$env:REDIS_SENTINEL_MASTER_NAME = 'task-queue'
+$env:REDIS_SENTINEL_PASSWORD = 'local-sentinel-change-me'
+$env:PORT = '3001'
+$env:REDIS_PORT = '6381'
+$ha = @('-p', 'task-queue-ha', '-f', 'docker-compose.yml', '-f', 'docker-compose.ha.yml', '--profile', 'ha-redis')
+docker compose @ha up -d --build
+docker compose @ha exec redis-sentinel-1 sh -c 'REDISCLI_AUTH="$REDIS_SENTINEL_PASSWORD" redis-cli -p 26379 SENTINEL ckquorum "$REDIS_SENTINEL_MASTER_NAME"'
+docker compose @ha exec redis-sentinel-1 sh -c 'REDISCLI_AUTH="$REDIS_SENTINEL_PASSWORD" redis-cli -p 26379 SENTINEL get-master-addr-by-name "$REDIS_SENTINEL_MASTER_NAME"'
+# In this disposable demo only: stop the current primary, then wait for promotion.
+docker compose @ha stop redis
+Start-Sleep -Seconds 10
+curl.exe --retry 45 --retry-delay 1 --retry-all-errors --fail http://localhost:3001/health/ready
+docker compose @ha exec redis-sentinel-1 sh -c 'REDISCLI_AUTH="$REDIS_SENTINEL_PASSWORD" redis-cli -p 26379 SENTINEL get-master-addr-by-name "$REDIS_SENTINEL_MASTER_NAME"'
+docker compose @ha exec redis-replica sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ROLE'
+docker compose @ha start redis
+```
+
+The discovered master changes from `172.30.0.10` to `172.30.0.11`, readiness recovers, and the
+returned ROLE is `master`. The old primary is reconfigured as a replica after it
+returns. Submit/read a task before and after failover using your existing API
+credentials to verify application recovery.
+
+This single-host, one-replica demo is not production HA or a zero-data-loss
+guarantee: Redis replication is asynchronous. Place Sentinels/data nodes across
+failure domains for production and secure their network/TLS configuration. The
+profile's control ports (26379/26380/26381) bind to loopback, but advertised
+Docker data-node addresses are intended for **in-network clients**, not host
+processes. External Sentinel deployments must advertise client-reachable data
+addresses. Existing `rediss://` standalone connections are unchanged; the local
+Sentinel profile uses plain TCP.
+Applying the overlay to an existing network can require planned network
+recreation and data migration; do not try to replace a running default stack
+blindly. The isolated project above starts with its own data volumes.
+
+Do not simply unset Sentinel after promotion: the service named `redis` may now
+be a replica. A standalone transition must quiesce producers/workers, choose the
+active primary and explicitly remove replication/reconfigure routing before
+resuming writes. Never delete Redis volumes to perform a normal transition.
+Sentinel configuration volumes contain authentication values; protect them and
+their backups. Changing persisted Sentinel group/credentials also requires coordinated
+configuration updates rather than blindly reseeding its files.
+
+`npm run ci` requires neither OpenBao nor real Sentinels: local HTTP mocks test
+KV v2/AppRole and fail-fast startup in API/worker child processes; a local RESP
+Sentinel fake resolves the disposable test Redis and verifies client duplication.
+All existing standalone tests remain enabled.
 
 ### Git setup
 

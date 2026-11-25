@@ -277,8 +277,13 @@ describe('audit log', () => {
       ]),
     };
     const logger = pino({ level: 'silent' });
+    const sink = {
+      write: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+    };
     const audit = createAuditLog({
       logger,
+      sink,
       redis: redis as never,
       streamKey: 'svc:audit:admin',
       maxEntries: 50,
@@ -311,5 +316,7 @@ describe('audit log', () => {
 
     redis.xadd.mockRejectedValueOnce(new Error('READONLY'));
     await expect(audit.record(event)).resolves.toBeUndefined();
+    expect(sink.write).toHaveBeenCalledTimes(2);
+    expect(sink.write).toHaveBeenLastCalledWith(expect.objectContaining(event));
   });
 });

@@ -26,6 +26,11 @@ export default defineConfig({
       API_KEYS,
       ADMIN_USERNAME,
       ADMIN_PASSWORD,
+      ADMIN_AUTH_MODE: 'basic',
+      AUDIT_WORM_ENABLED: 'false',
+      SECRETS_PROVIDER: 'env',
+      REDIS_SENTINEL_HOSTS: '',
+      REDIS_SENTINEL_MASTER_NAME: '',
       // Short, deterministic retry schedule: 3 attempts, 100ms then 200ms backoff.
       TASK_MAX_ATTEMPTS: '3',
       TASK_BACKOFF_DELAY_MS: '100',

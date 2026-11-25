@@ -98,6 +98,11 @@ export interface AdminCredentials {
 export const getAdminActor = (locals: Record<string, unknown>): string | null =>
   typeof locals.adminActor === 'string' ? locals.adminActor : null;
 
+export const getAdminIdentity = (locals: Record<string, unknown>) => ({
+  subject: typeof locals.adminSubject === 'string' ? locals.adminSubject : null,
+  role: locals.adminRole === 'admin' || locals.adminRole === 'viewer' ? locals.adminRole : null,
+});
+
 /**
  * HTTP Basic auth for operator surfaces. Without a configured password the admin
  * surface is disabled (secure by default) instead of being exposed anonymously.
@@ -127,6 +132,8 @@ export const adminAuth = (credentials: AdminCredentials): RequestHandler => {
         );
         if (userMatches && passwordMatches) {
           response.locals.adminActor = credentials.username;
+          response.locals.adminSubject = credentials.username;
+          response.locals.adminRole = 'admin';
           next();
           return;
         }

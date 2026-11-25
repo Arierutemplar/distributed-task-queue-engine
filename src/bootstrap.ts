@@ -1,9 +1,21 @@
 import type { Server } from 'node:http';
+import { once } from 'node:events';
 import type { Store } from 'express-rate-limit';
 import type { Redis } from 'ioredis';
 import type { Logger } from 'pino';
 import { RedisStore, type RedisReply } from 'rate-limit-redis';
 import type { ReadinessCheck } from './routes/health.routes.js';
+import { withTimeout } from './resilience/timeout.js';
+
+export const waitForRedisReady = async (
+  connection: NodeJS.EventEmitter & Pick<Redis, 'status'>,
+  timeoutMs: number,
+): Promise<void> => {
+  if (connection.status === 'ready') return;
+  await withTimeout(async (signal) => {
+    await once(connection, 'ready', { signal });
+  }, timeoutMs);
+};
 
 export const closeServer = (server: Server): Promise<void> =>
   new Promise((resolve, reject) => {

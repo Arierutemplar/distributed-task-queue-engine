@@ -4,6 +4,28 @@ info:
   version: 1.0.0
   description: |
     Task and admin routes are available in API and all roles. Metrics can be disabled.
+    ADMIN_AUTH_MODE defaults to basic; oidc enables Keycloak Bearer JWTs or encrypted
+    HttpOnly sessions via Authorization Code + PKCE. OIDC_ISSUER_URL is the internal
+    JWKS/token base; OIDC_PUBLIC_ISSUER_URL is the issuer in tokens and browser URLs
+    (defaults to OIDC_ISSUER_URL). OIDC_CLIENT_ID is the required JWT audience;
+    OIDC_CLIENT_SECRET is optional for public PKCE clients. OIDC_REDIRECT_URI and
+    SESSION_SECRET (32+ characters) are required in oidc mode.
+    Non-local URLs require HTTPS; the local Compose demo permits HTTP even in the
+    production Node image. Production deployments must use HTTPS. Cookies are Secure with HTTPS and
+    SameSite=Lax; cookie-authenticated writes require a matching Origin.
+    Realm roles or resource_access.<OIDC_CLIENT_ID>.roles grant admin full access
+    or viewer read-only access. Writes denied with 403 are audited with subject/role.
+    Administrative audit stays in Redis and structured logs. AUDIT_WORM_ENABLED
+    defaults to false; enabling it with complete AUDIT_WORM_ACCESS_KEY_ID and
+    AUDIT_WORM_SECRET_ACCESS_KEY adds best-effort S3 Object Lock export, one JSON
+    object per event. AUDIT_WORM_ENDPOINT is optional for AWS regional S3 or points
+    to local MinIO; AUDIT_WORM_REGION defaults to us-east-1,
+    AUDIT_WORM_BUCKET to audit-worm, AUDIT_WORM_FORCE_PATH_STYLE to true,
+    AUDIT_WORM_LOCK_MODE to GOVERNANCE (COMPLIANCE is also supported),
+    AUDIT_WORM_RETENTION_DAYS to 30 and AUDIT_WORM_TIMEOUT_MS to 5000.
+    Incomplete credentials disable archival with a warning. Archive failures are
+    logged without credentials and do not change API responses. The audit read
+    API still reads Redis, not S3; no new storage API or security scheme is added.
     In non-production environments without API_KEYS, task requests use the public tenant.
     X-Request-Id is echoed on every response; invalid values are replaced.
 paths:
@@ -109,6 +131,8 @@ paths:
       description: Bull Board also serves its own assets and API under this path; the dead-letter queue is read-only in the UI.
       security:
         - BasicAuth: []
+        - OidcBearer: []
+        - AdminSession: []
       parameters:
         - $ref: '#/components/parameters/RequestId'
       responses:
@@ -118,6 +142,8 @@ paths:
             text/html:
               schema: { type: string }
         '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '302': { description: OIDC browser login redirect when no credentials are present }
+        '403': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
   /admin/api/dead-letter:
@@ -125,6 +151,8 @@ paths:
       summary: List dead-letter entries
       security:
         - BasicAuth: []
+        - OidcBearer: []
+        - AdminSession: []
       parameters:
         - $ref: '#/components/parameters/RequestId'
         - name: limit
@@ -150,14 +178,17 @@ paths:
                     items: { $ref: '#/components/schemas/DeadLetter' }
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '403': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }
         '500': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
   /admin/api/dead-letter/{taskId}/replay:
     post:
-      summary: Replay with a new task ID and the original tenant
+      summary: Replay with a new task ID and the original tenant (admin role required)
       security:
         - BasicAuth: []
+        - OidcBearer: []
+        - AdminSession: []
       parameters:
         - $ref: '#/components/parameters/RequestId'
         - $ref: '#/components/parameters/TaskId'
@@ -175,6 +206,7 @@ paths:
                       replayOf: { type: string }
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }
@@ -182,9 +214,11 @@ paths:
         '503': { $ref: '#/components/responses/Error' }
   /admin/api/dead-letter/{taskId}:
     delete:
-      summary: Delete a dead-letter entry
+      summary: Delete a dead-letter entry (admin role required)
       security:
         - BasicAuth: []
+        - OidcBearer: []
+        - AdminSession: []
       parameters:
         - $ref: '#/components/parameters/RequestId'
         - $ref: '#/components/parameters/TaskId'
@@ -192,6 +226,7 @@ paths:
         '204': { description: Entry deleted }
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }
         '500': { $ref: '#/components/responses/Error' }
@@ -199,8 +234,11 @@ paths:
   /admin/api/audit:
     get:
       summary: Read recent admin audit records
+      description: Reads the capped Redis trail. Optional WORM copies are independent versioned S3 objects, not returned by this endpoint.
       security:
         - BasicAuth: []
+        - OidcBearer: []
+        - AdminSession: []
       parameters:
         - $ref: '#/components/parameters/RequestId'
         - name: limit
@@ -220,13 +258,48 @@ paths:
                     items: { $ref: '#/components/schemas/AuditRecord' }
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '403': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }
         '500': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
+  /admin/login:
+    get:
+      summary: Start Keycloak Authorization Code login with PKCE (OIDC mode only)
+      security: []
+      responses:
+        '302':
+          { description: Sets an encrypted ten-minute transaction cookie and redirects to Keycloak }
+        '429': { $ref: '#/components/responses/Error' }
+  /admin/callback:
+    get:
+      summary: Verify state, code, PKCE and nonce; set an encrypted HttpOnly session (OIDC only)
+      security: []
+      parameters:
+        - { name: code, in: query, required: true, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
+      responses:
+        '302': { description: Session created; redirect to /admin/queues }
+        '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /admin/logout:
+    get:
+      summary: Clear local session and redirect to Keycloak logout (OIDC only)
+      security: []
+      responses:
+        '302': { description: Cookies cleared; Keycloak may ask to confirm SSO logout }
+        '429': { $ref: '#/components/responses/Error' }
 components:
   securitySchemes:
     ApiKey: { type: apiKey, in: header, name: X-API-Key }
     BasicAuth: { type: http, scheme: basic }
+    OidcBearer: { type: http, scheme: bearer, bearerFormat: JWT }
+    AdminSession:
+      type: apiKey
+      in: cookie
+      name: __Secure-admin_session
+      description: Encrypted HttpOnly cookie; local HTTP development uses admin_session instead.
   parameters:
     RequestId:
       name: X-Request-Id
@@ -244,7 +317,7 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     UnauthorizedAdmin:
-      description: Basic credentials required
+      description: Basic credentials or a valid OIDC token/session required (depending on ADMIN_AUTH_MODE)
       headers:
         WWW-Authenticate:
           schema: { type: string }
@@ -428,6 +501,8 @@ components:
       type: object
       required: [timestamp, action, outcome, actor, requestId, method, path]
       properties:
+        subject: { type: string, nullable: true, description: OIDC sub or Basic username }
+        role: { type: string, nullable: true, enum: [admin, viewer, null] }
         id: { type: string }
         timestamp: { type: string, format: date-time }
         action: { type: string }

@@ -13,14 +13,15 @@ import { z } from 'zod';
 import { config, runsApi, type AppConfig } from './config/env.js';
 import { logger } from './config/logger.js';
 import {
-  adminAuth,
   apiKeyAuth,
   getAdminActor,
+  getAdminIdentity,
   getRequestId,
   getTenantId,
   httpMetrics,
   requestId,
 } from './middleware/http.middleware.js';
+import { createAdminSecurity } from './middleware/oidc.middleware.js';
 import { createAuditLog, type AuditAction, type AuditLog } from './observability/audit.js';
 import { metricsRegistry } from './observability/metrics.js';
 import { traceRequests } from './observability/tracing.js';
@@ -52,6 +53,7 @@ const auditLimitSchema = z.coerce.number().int().min(1).max(1_000).default(100);
 // Responses on the admin surface that are security relevant even without a handler-level record.
 const adminAccessAction = (request: Request, statusCode: number): AuditAction | undefined => {
   if (statusCode === 401) return 'admin.auth_failed';
+  if (statusCode === 403) return 'admin.access_denied';
   if (statusCode === 429) return 'admin.auth_locked';
   if (statusCode === 503) return 'admin.disabled';
   // Bull Board mutations (retry, clean, promote, remove...) are operator actions too.
@@ -74,6 +76,15 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
   app.use(
     pinoHttp<Request, Response>({
       logger,
+      serializers: {
+        req: (request: { url?: string }) => ({
+          ...request,
+          url:
+            request.url && /^\/admin\/callback(?:\/|\?|$)/iu.test(request.url)
+              ? '/admin/callback'
+              : request.url,
+        }),
+      },
       genReqId: (_request, response) => getRequestId(response.locals),
       customSuccessObject: (_request, response, fields: Record<string, unknown>) => ({
         ...fields,
@@ -180,10 +191,7 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
       },
     });
 
-    const requireAdmin = adminAuth({
-      username: settings.ADMIN_USERNAME,
-      password: settings.ADMIN_PASSWORD,
-    });
+    const security = createAdminSecurity(settings);
     app.use('/admin', (request, response, next) => {
       response.once('finish', () => {
         const action = adminAccessAction(request, response.statusCode);
@@ -194,6 +202,7 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
           action,
           outcome: response.statusCode < 400 ? 'success' : 'denied',
           actor: getAdminActor(response.locals),
+          ...getAdminIdentity(response.locals),
           requestId: getRequestId(response.locals),
           method: request.method,
           path: request.originalUrl.split('?')[0] ?? request.originalUrl,
@@ -204,7 +213,8 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
       next();
     });
     app.use('/admin', adminAuthLimiter);
-    app.get('/admin/api/audit', requireAdmin, async (request, response, next) => {
+    app.use('/admin', security.router, security.authenticate);
+    app.get('/admin/api/audit', async (request, response, next) => {
       const limit = auditLimitSchema.safeParse(request.query.limit);
       if (!limit.success) {
         response.status(400).json({ error: 'Invalid limit' });
@@ -216,6 +226,7 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
           action: 'admin.audit_read',
           outcome: 'success',
           actor: getAdminActor(response.locals),
+          ...getAdminIdentity(response.locals),
           requestId: getRequestId(response.locals),
           method: request.method,
           path: '/admin/api/audit',
@@ -229,11 +240,10 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
     });
     app.use(
       '/admin/api/dead-letter',
-      requireAdmin,
       express.json({ limit: '16kb' }),
       createDeadLetterRouter(audit),
     );
-    app.use('/admin/queues', requireAdmin, boardRouter);
+    app.use('/admin/queues', boardRouter);
   }
 
   app.use((_request, response) => {

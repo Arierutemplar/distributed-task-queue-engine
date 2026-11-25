@@ -224,6 +224,8 @@ describe('admin surface', () => {
         outcome: 'success',
         actor: 'admin',
         requestId: replay.headers['x-request-id'],
+        subject: 'admin',
+        role: 'admin',
         tenantId: 'key-original-tenant',
         taskId: '9',
         newTaskId: 'replayed-1',

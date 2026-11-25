@@ -1,4 +1,5 @@
 import { createServer, type Server } from 'node:http';
+import { EventEmitter } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import pino from 'pino';
 import { describe, expect, it, vi } from 'vitest';
@@ -7,9 +8,43 @@ import {
   createGracefulShutdown,
   createReadinessChecks,
   redisRateLimitStoreFactory,
+  waitForRedisReady,
 } from '../src/bootstrap.js';
 
 const logger = pino({ level: 'silent' });
+
+describe('Sentinel coordination startup readiness', () => {
+  it('gates initialization until the independently resolving connection is ready', async () => {
+    const connection = Object.assign(new EventEmitter(), { status: 'connecting' as const });
+    let initialized = false;
+    const waiting = waitForRedisReady(connection, 1_000).then(() => {
+      initialized = true;
+    });
+    await Promise.resolve();
+    expect(initialized).toBe(false);
+    connection.emit('ready');
+    await waiting;
+    expect(initialized).toBe(true);
+    expect(connection.listenerCount('ready')).toBe(0);
+    await expect(
+      waitForRedisReady(Object.assign(new EventEmitter(), { status: 'ready' as const }), 1_000),
+    ).resolves.toBeUndefined();
+  });
+
+  it('fails bounded startup and removes listeners when coordination never becomes ready', async () => {
+    vi.useFakeTimers();
+    try {
+      const connection = Object.assign(new EventEmitter(), { status: 'connecting' as const });
+      const waiting = expect(waitForRedisReady(connection, 100)).rejects.toThrow('100ms');
+      await vi.advanceTimersByTimeAsync(100);
+      await waiting;
+      expect(connection.listenerCount('ready')).toBe(0);
+      expect(connection.listenerCount('error')).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('createGracefulShutdown', () => {
   it('runs the steps in order, keeps going after a failure, and shares one run', async () => {

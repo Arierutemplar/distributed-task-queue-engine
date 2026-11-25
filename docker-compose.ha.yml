@@ -1,0 +1,34 @@
+# Optional overlay for reproducible container-stop failover, including Docker Desktop.
+# Stable data-node IPs avoid blocking Sentinel/replica DNS lookups for stopped containers.
+# Use with docker-compose.yml and --profile ha-redis in a fresh/isolated project.
+services:
+  redis:
+    environment:
+      REDIS_HA_NODE_IP: ${REDIS_HA_PRIMARY_IP:-172.30.0.10}
+    networks:
+      queue-net:
+        ipv4_address: ${REDIS_HA_PRIMARY_IP:-172.30.0.10}
+
+  redis-replica:
+    environment:
+      REDIS_HA_PRIMARY_IP: ${REDIS_HA_PRIMARY_IP:-172.30.0.10}
+      REDIS_HA_NODE_IP: ${REDIS_HA_REPLICA_IP:-172.30.0.11}
+    networks:
+      queue-net:
+        ipv4_address: ${REDIS_HA_REPLICA_IP:-172.30.0.11}
+
+  redis-sentinel-1:
+    environment:
+      REDIS_HA_PRIMARY_IP: ${REDIS_HA_PRIMARY_IP:-172.30.0.10}
+  redis-sentinel-2:
+    environment:
+      REDIS_HA_PRIMARY_IP: ${REDIS_HA_PRIMARY_IP:-172.30.0.10}
+  redis-sentinel-3:
+    environment:
+      REDIS_HA_PRIMARY_IP: ${REDIS_HA_PRIMARY_IP:-172.30.0.10}
+
+networks:
+  queue-net:
+    ipam:
+      config:
+        - subnet: ${REDIS_HA_SUBNET:-172.30.0.0/24}

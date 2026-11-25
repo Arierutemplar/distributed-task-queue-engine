@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { getAdminActor, getRequestId } from '../middleware/http.middleware.js';
+import { getAdminActor, getAdminIdentity, getRequestId } from '../middleware/http.middleware.js';
 import type { AuditEvent, AuditLog } from '../observability/audit.js';
 import { deadLetterJobId, deadLetterQueue } from '../queues/dead-letter.queue.js';
 import { dispatchTask } from '../services/task.service.js';
@@ -23,6 +23,7 @@ export const createDeadLetterRouter = (audit: AuditLog): Router => {
   ): Promise<void> =>
     audit.record({
       actor: getAdminActor(response.locals),
+      ...getAdminIdentity(response.locals),
       requestId: getRequestId(response.locals),
       method: request.method,
       path: request.originalUrl.split('?')[0] ?? request.originalUrl,

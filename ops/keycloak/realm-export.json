@@ -1,0 +1,62 @@
+{
+  "realm": "task-queue",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 300,
+  "roles": {
+    "realm": [{ "name": "admin" }, { "name": "viewer" }]
+  },
+  "clients": [
+    {
+      "clientId": "task-queue-admin",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "fullScopeAllowed": true,
+      "redirectUris": ["http://localhost:3000/admin/callback"],
+      "webOrigins": ["http://localhost:3000"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:3000/admin/login"
+      },
+      "defaultClientScopes": ["basic", "profile", "email", "roles"],
+      "protocolMappers": [
+        {
+          "name": "admin-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "task-queue-admin",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "admin",
+      "enabled": true,
+      "email": "admin@example.test",
+      "emailVerified": true,
+      "firstName": "Local",
+      "lastName": "Admin",
+      "realmRoles": ["admin"],
+      "credentials": [{ "type": "password", "value": "local-admin-change-me", "temporary": false }]
+    },
+    {
+      "username": "viewer",
+      "enabled": true,
+      "email": "viewer@example.test",
+      "emailVerified": true,
+      "firstName": "Local",
+      "lastName": "Viewer",
+      "realmRoles": ["viewer"],
+      "credentials": [{ "type": "password", "value": "local-viewer-change-me", "temporary": false }]
+    }
+  ]
+}
