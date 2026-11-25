@@ -22,6 +22,7 @@ vi.mock('../src/queues/task.queue.js', () => ({
 }));
 
 vi.mock('../src/queues/dead-letter.queue.js', () => ({
+  readDeadLetterCounts: vi.fn(async () => ({})),
   DEAD_LETTER_QUEUE_NAME: 'tasks-dead-letter',
   DEAD_LETTER_JOB_NAME: 'dead-letter',
   deadLetterJobId: (id: string) => `dlq-${id}`,

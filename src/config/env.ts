@@ -115,6 +115,7 @@ export const envSchema = z
     // Tracing is opt-in; the OTLP exporter reads the standard OTEL_EXPORTER_OTLP_* variables itself.
     OTEL_ENABLED: z.preprocess(emptyToUndefined, booleanFromString.default(false)),
     OTEL_EXPORTER_OTLP_ENDPOINT: z.preprocess(emptyToUndefined, z.url().optional()),
+    OTEL_SERVICE_NAME: z.preprocess(emptyToUndefined, z.string().trim().min(1).optional()),
   })
   .superRefine((settings, context) => {
     if (

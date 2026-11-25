@@ -1,18 +1,11 @@
 import { Worker } from 'bullmq';
+import { SpanKind, trace } from '@opentelemetry/api';
 import { config } from '../config/env.js';
 import { logger } from '../config/logger.js';
 import { coordinationRedis, redis } from '../config/redis.js';
-import {
-  tasksDeadLetteredTotal,
-  taskDuration,
-  tasksProcessedTotal,
-  setCircuitState,
-} from '../observability/metrics.js';
-import {
-  DEAD_LETTER_JOB_NAME,
-  deadLetterJobId,
-  deadLetterQueue,
-} from '../queues/dead-letter.queue.js';
+import { taskDuration, tasksProcessedTotal, setCircuitState } from '../observability/metrics.js';
+import { jobAttemptContext, withJobSpan, withTraceContext } from '../observability/tracing.js';
+import { addDeadLetter } from '../queues/dead-letter.queue.js';
 import { TASK_QUEUE_NAME } from '../queues/task.queue.js';
 import { RedisCircuitBreaker } from '../resilience/redis-circuit-breaker.js';
 import { BillingMockService, type BillingGateway } from '../services/billing.mock.service.js';
@@ -30,36 +23,46 @@ const attemptSeconds = (job: TaskJob): number | undefined =>
  * The deterministic DLQ job id makes this idempotent if two workers observe the same failure.
  */
 export const routeToDeadLetter = async (job: TaskJob, error: Error): Promise<boolean> => {
-  const state = await job.getState();
-  if (state !== 'failed' || !job.id) {
+  if (!job.id) {
     return false;
   }
+  const taskId = job.id;
 
-  await deadLetterQueue.add(
-    DEAD_LETTER_JOB_NAME,
+  return withJobSpan(
+    'dead-letter.route',
+    jobAttemptContext(job) ?? job.data.meta,
     {
-      originalJobId: job.id,
-      taskType: job.name,
-      data: job.data,
-      failedReason: job.failedReason || error.message,
-      attemptsMade: job.attemptsMade,
-      failedAt: new Date(job.finishedOn ?? Date.now()).toISOString(),
+      'task.id': taskId,
+      'task.type': job.name,
+      ...(job.data.meta?.requestId ? { 'request.id': job.data.meta.requestId } : {}),
+      ...(job.data.meta?.tenantId ? { 'tenant.id': job.data.meta.tenantId } : {}),
     },
-    { jobId: deadLetterJobId(job.id) },
-  );
-  tasksDeadLetteredTotal.inc({ task_type: job.name });
-  logger.error(
-    {
-      jobId: job.id,
-      taskType: job.name,
-      attemptsMade: job.attemptsMade,
-      tenantId: job.data.meta?.tenantId,
-      requestId: job.data.meta?.requestId,
-      err: error,
+    async () => {
+      const routed = await addDeadLetter({
+        originalJobId: taskId,
+        taskType: job.name,
+        data: job.data,
+        failedReason: job.failedReason || error.message,
+        attemptsMade: job.attemptsMade,
+        failedAt: new Date(job.finishedOn ?? Date.now()).toISOString(),
+      });
+      trace.getActiveSpan()?.setAttribute('dead_letter.routed', routed);
+      if (!routed) return false;
+      logger.error(
+        {
+          jobId: job.id,
+          taskType: job.name,
+          attemptsMade: job.attemptsMade,
+          tenantId: job.data.meta?.tenantId,
+          requestId: job.data.meta?.requestId,
+          err: error,
+        },
+        'Task exhausted its attempts and was moved to the dead-letter queue',
+      );
+      return true;
     },
-    'Task exhausted its attempts and was moved to the dead-letter queue',
+    SpanKind.PRODUCER,
   );
-  return true;
 };
 
 export interface TaskWorkerOptions {
@@ -108,18 +111,20 @@ export const createTaskWorker = (
     if (seconds !== undefined) {
       taskDuration.observe({ task_type: job.name, outcome: 'completed' }, seconds);
     }
-    logger.info(
-      {
-        jobId: job.id,
-        taskType: job.name,
-        attempt: job.attemptsMade,
-        maxAttempts: job.opts.attempts ?? 1,
-        durationSeconds: seconds,
-        requestId: job.data.meta?.requestId,
-        result,
-      },
-      'Task completed',
-    );
+    withTraceContext(jobAttemptContext(job) ?? job.data.meta, () => {
+      logger.info(
+        {
+          jobId: job.id,
+          taskType: job.name,
+          attempt: job.attemptsMade,
+          maxAttempts: job.opts.attempts ?? 1,
+          durationSeconds: seconds,
+          requestId: job.data.meta?.requestId,
+          result,
+        },
+        'Task completed',
+      );
+    });
   });
 
   worker.on('failed', (job, error) => {
@@ -132,22 +137,26 @@ export const createTaskWorker = (
     if (seconds !== undefined) {
       taskDuration.observe({ task_type: job.name, outcome: 'failed' }, seconds);
     }
-    logger.error(
-      {
-        jobId: job.id,
-        taskType: job.name,
-        attempt: job.attemptsMade,
-        maxAttempts: job.opts.attempts ?? 1,
-        requestId: job.data.meta?.requestId,
-        err: error,
-      },
-      'Task attempt failed',
-    );
-    void routeToDeadLetter(job, error).catch((dlqError: unknown) => {
+    withTraceContext(jobAttemptContext(job) ?? job.data.meta, () => {
       logger.error(
-        { jobId: job.id, err: dlqError },
-        'Failed to move task to the dead-letter queue',
+        {
+          jobId: job.id,
+          taskType: job.name,
+          attempt: job.attemptsMade,
+          maxAttempts: job.opts.attempts ?? 1,
+          requestId: job.data.meta?.requestId,
+          err: error,
+        },
+        'Task attempt failed',
       );
+    });
+    void routeToDeadLetter(job, error).catch((dlqError: unknown) => {
+      withTraceContext(jobAttemptContext(job) ?? job.data.meta, () => {
+        logger.error(
+          { jobId: job.id, requestId: job.data.meta?.requestId, err: dlqError },
+          'Failed to move task to the dead-letter queue',
+        );
+      });
     });
   });
 

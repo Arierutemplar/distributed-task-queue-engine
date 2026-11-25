@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { trace } from '@opentelemetry/api';
 import type { Redis } from 'ioredis';
 import { CircuitOpenError, type CircuitState } from './circuit-breaker.js';
 
@@ -86,6 +87,7 @@ export class RedisCircuitBreaker {
     }
     const generation: string = reply[1];
     const state = parseState(reply[0]);
+    trace.getActiveSpan()?.setAttribute('circuit_breaker.state', state);
     this.observe(state);
     if (reply[3] !== 0 && reply[3] !== 1) {
       throw new Error('Invalid circuit acquisition decision from Redis');
@@ -109,7 +111,9 @@ export class RedisCircuitBreaker {
         this.options.failureThreshold,
         this.options.resetTimeoutMs,
       );
-      this.observe(parseState(next));
+      const nextState = parseState(next);
+      trace.getActiveSpan()?.setAttribute('circuit_breaker.state', nextState);
+      this.observe(nextState);
     };
 
     let result: T;

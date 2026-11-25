@@ -27,6 +27,8 @@ vi.mock('../src/queues/dead-letter.queue.js', () => ({
   DEAD_LETTER_QUEUE_NAME: 'tasks-dead-letter',
   DEAD_LETTER_JOB_NAME: 'dead-letter',
   deadLetterJobId: (id: string) => `dlq-${id}`,
+  addDeadLetter: mocks.deadLetterAdd,
+  readDeadLetterCounts: vi.fn(async () => ({})),
   deadLetterQueue: {
     name: 'tasks-dead-letter',
     add: mocks.deadLetterAdd,
@@ -426,20 +428,20 @@ describe('routeToDeadLetter', () => {
     }) as unknown as TaskJob;
 
   it('copies terminally failed jobs with a deterministic id', async () => {
+    mocks.deadLetterAdd.mockResolvedValueOnce(true);
     await expect(routeToDeadLetter(job('failed'), new Error('x'))).resolves.toBe(true);
     expect(mocks.deadLetterAdd).toHaveBeenCalledWith(
-      'dead-letter',
       expect.objectContaining({
         originalJobId: '42',
         attemptsMade: 5,
         failedAt: '2026-01-01T00:00:00.000Z',
       }),
-      { jobId: 'dlq-42' },
     );
   });
 
   it('ignores attempts that BullMQ will retry', async () => {
+    mocks.deadLetterAdd.mockResolvedValueOnce(false);
     await expect(routeToDeadLetter(job('delayed'), new Error('x'))).resolves.toBe(false);
-    expect(mocks.deadLetterAdd).not.toHaveBeenCalled();
+    expect(mocks.deadLetterAdd).toHaveBeenCalledOnce();
   });
 });

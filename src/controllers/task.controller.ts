@@ -1,4 +1,5 @@
 import type { RequestHandler } from 'express';
+import { trace } from '@opentelemetry/api';
 import { getRequestId, getTenantId } from '../middleware/http.middleware.js';
 import { tasksEnqueuedTotal } from '../observability/metrics.js';
 import { dispatchTask, getTaskStatus } from '../services/task.service.js';
@@ -29,11 +30,19 @@ export const processTask: RequestHandler = async (request, response, next) => {
   }
 
   try {
+    const requestId = getRequestId(response.locals);
+    const tenantId = getTenantId(response.locals);
+    trace.getActiveSpan()?.setAttributes({
+      'request.id': requestId,
+      'tenant.id': tenantId,
+      'task.type': parsedPayload.data.type,
+    });
     const { response: accepted, replayed } = await dispatchTask(parsedPayload.data, {
-      requestId: getRequestId(response.locals),
-      tenantId: getTenantId(response.locals),
+      requestId,
+      tenantId,
       idempotencyKey: parsedKey?.data,
     });
+    trace.getActiveSpan()?.setAttribute('task.id', accepted.taskId);
     tasksEnqueuedTotal.inc({ task_type: accepted.taskType, replayed: String(replayed) });
     response.setHeader('Location', `${request.baseUrl}/${accepted.taskId}`);
     if (replayed) {

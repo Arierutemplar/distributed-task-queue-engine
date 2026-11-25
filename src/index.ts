@@ -72,7 +72,8 @@ const startServer = async (): Promise<void> => {
 
   tracing = await initTracing({
     enabled: config.OTEL_ENABLED,
-    serviceName: config.SERVICE_NAME,
+    endpoint: config.OTEL_EXPORTER_OTLP_ENDPOINT,
+    serviceName: config.OTEL_SERVICE_NAME ?? config.SERVICE_NAME,
     role: config.PROCESS_ROLE,
   });
   if (tracing) {

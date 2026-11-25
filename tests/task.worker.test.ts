@@ -4,13 +4,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { TaskJob } from '../src/workers/task.processor.js';
 
 const mocks = vi.hoisted(() => ({
-  add: vi.fn(),
+  add: vi.fn(async () => true),
   info: vi.fn(),
   warn: vi.fn(),
   error: vi.fn(),
   processed: vi.fn(),
   duration: vi.fn(),
-  deadLettered: vi.fn(),
   state: vi.fn(),
 }));
 
@@ -26,14 +25,11 @@ vi.mock('../src/config/logger.js', () => ({ logger: mocks }));
 vi.mock('../src/observability/metrics.js', () => ({
   tasksProcessedTotal: { inc: mocks.processed },
   taskDuration: { observe: mocks.duration },
-  tasksDeadLetteredTotal: { inc: mocks.deadLettered },
   setCircuitState: mocks.state,
 }));
 vi.mock('../src/queues/task.queue.js', () => ({ TASK_QUEUE_NAME: 'tasks' }));
 vi.mock('../src/queues/dead-letter.queue.js', () => ({
-  DEAD_LETTER_JOB_NAME: 'dead-letter',
-  deadLetterJobId: (id: string) => `dlq-${id}`,
-  deadLetterQueue: { add: mocks.add },
+  addDeadLetter: mocks.add,
 }));
 
 import { createTaskWorker, routeToDeadLetter } from '../src/workers/task.worker.js';
@@ -74,9 +70,7 @@ describe('worker events', () => {
     expect(mocks.processed).toHaveBeenCalledWith({ task_type: job.name, outcome: 'failed' });
     expect(mocks.duration).toHaveBeenCalledWith({ task_type: job.name, outcome: 'failed' }, 1.5);
     expect(mocks.add).toHaveBeenCalledWith(
-      'dead-letter',
       expect.objectContaining({ failedReason: 'failure', originalJobId: '42' }),
-      { jobId: 'dlq-42' },
     );
     worker.emit('failed', undefined, new Error('no job'), 'active');
     worker.emit('stalled', '42', 'active');

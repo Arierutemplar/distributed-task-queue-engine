@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { currentTraceContext } from '../observability/tracing.js';
+import { SpanKind, trace } from '@opentelemetry/api';
+import { currentTraceContext, withSpan } from '../observability/tracing.js';
 import { deadLetterJobId, deadLetterQueue } from '../queues/dead-letter.queue.js';
 import { taskQueue } from '../queues/task.queue.js';
 import {
@@ -50,57 +51,64 @@ const toIso = (epochMs: number | undefined): string | null =>
 export const dispatchTask = async (
   payload: TaskPayload,
   options: DispatchOptions,
-): Promise<DispatchResult> => {
-  const meta: TaskJobMeta = {
-    requestId: options.requestId,
-    tenantId: options.tenantId,
-    payloadHash: payloadFingerprint(payload),
-    acceptedAt: new Date().toISOString(),
-    ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-    ...(options.replayOf ? { replayOf: options.replayOf } : {}),
-    ...currentTraceContext(),
-  };
-  const jobId = options.idempotencyKey
-    ? idempotentJobId(options.tenantId, options.idempotencyKey)
-    : undefined;
+): Promise<DispatchResult> =>
+  withSpan(
+    'enqueue task',
+    SpanKind.PRODUCER,
+    { 'request.id': options.requestId, 'tenant.id': options.tenantId, 'task.type': payload.type },
+    async () => {
+      const meta: TaskJobMeta = {
+        requestId: options.requestId,
+        tenantId: options.tenantId,
+        payloadHash: payloadFingerprint(payload),
+        acceptedAt: new Date().toISOString(),
+        ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+        ...(options.replayOf ? { replayOf: options.replayOf } : {}),
+        ...currentTraceContext(),
+      };
+      const jobId = options.idempotencyKey
+        ? idempotentJobId(options.tenantId, options.idempotencyKey)
+        : undefined;
 
-  const job = await taskQueue.add(
-    payload.type,
-    { ...payload, meta },
-    jobId ? { jobId } : undefined,
-  );
+      const job = await taskQueue.add(
+        payload.type,
+        { ...payload, meta },
+        jobId ? { jobId } : undefined,
+      );
 
-  if (!job.id) {
-    throw new Error('Queue accepted the task without assigning a job ID');
-  }
-
-  let acceptedAt = meta.acceptedAt;
-  let replayed = false;
-
-  if (jobId) {
-    // Queue.add with an existing jobId is a no-op in Redis but returns our local data,
-    // so the stored job is the source of truth for replay and conflict detection.
-    const stored = await taskQueue.getJob(job.id);
-    const storedMeta = stored?.data.meta;
-    if (storedMeta) {
-      if (storedMeta.payloadHash !== meta.payloadHash) {
-        throw new IdempotencyConflictError();
+      if (!job.id) {
+        throw new Error('Queue accepted the task without assigning a job ID');
       }
-      replayed = storedMeta.requestId !== meta.requestId;
-      acceptedAt = storedMeta.acceptedAt;
-    }
-  }
+      trace.getActiveSpan()?.setAttribute('task.id', job.id);
 
-  return {
-    response: {
-      taskId: job.id,
-      taskType: payload.type,
-      status: 'accepted',
-      acceptedAt,
+      let acceptedAt = meta.acceptedAt;
+      let replayed = false;
+
+      if (jobId) {
+        // Queue.add with an existing jobId is a no-op in Redis but returns our local data,
+        // so the stored job is the source of truth for replay and conflict detection.
+        const stored = await taskQueue.getJob(job.id);
+        const storedMeta = stored?.data.meta;
+        if (storedMeta) {
+          if (storedMeta.payloadHash !== meta.payloadHash) {
+            throw new IdempotencyConflictError();
+          }
+          replayed = storedMeta.requestId !== meta.requestId;
+          acceptedAt = storedMeta.acceptedAt;
+        }
+      }
+
+      return {
+        response: {
+          taskId: job.id,
+          taskType: payload.type,
+          status: 'accepted',
+          acceptedAt,
+        },
+        replayed,
+      };
     },
-    replayed,
-  };
-};
+  );
 
 /** Returns null for unknown tasks and for tasks owned by another tenant, so ids cannot be probed. */
 export const getTaskStatus = async (

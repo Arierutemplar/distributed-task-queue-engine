@@ -83,7 +83,7 @@ Shutdown order, on `SIGTERM` or `SIGINT`, is HTTP server (idle keep-alive socket
 
 **Stalled jobs, which is the visibility timeout.** While a job is active, the worker holds a lock renewed every 15 seconds. If the process dies, the stalled checker returns the job to the queue and the worker logs `Task stalled and will be retried`. A job that stalls twice is failed.
 
-**Dead-letter queue.** When a job lands in the terminal failed state (attempts exhausted, unrecoverable, or stalled past the limit), the worker's `failed` handler confirms the state with `job.getState()` and adds a copy to `tasks-dead-letter` with the deterministic id `dlq-<jobId>`, so two workers observing the same failure produce one entry. Nothing consumes that queue. Operators list, replay, or delete entries through `/admin/api/dead-letter`; replay validates the payload against the current schema, enqueues it as a new job with `meta.replayOf`, and removes the entry. The copy is written after BullMQ commits the failure, not in the same Redis transaction: if the process dies in between, the job is still in the failed set for 7 days but has no dead-letter entry.
+**Dead-letter queue.** When a job lands in the terminal failed state (attempts exhausted, unrecoverable, or stalled past the limit), the worker's `failed` handler runs one Redis Lua script. It checks that the original job is still failed with the same finish time and attempt count, then atomically writes a BullMQ-compatible entry with deterministic id `dlq-<jobId>`, records the failure generation on the original job, and increments the routing worker's Redis-backed metric counter. Concurrent or repeated callbacks for that failure do not increment the counter or recreate an entry after an operator removes it. A later failure of the same original job can be routed again. The marker lasts as long as the original job is retained. Nothing consumes the DLQ. Operators list, replay, or delete entries through `/admin/api/dead-letter`; replay validates the payload against the current schema, enqueues it as a new job with `meta.replayOf`, and removes the entry. The copy still happens after BullMQ commits the failure, not in the same Redis transaction: if the process dies in between, or the Redis script fails, the job remains in the failed set subject to retention but may have no dead-letter entry. Redis Lua prevents interleaving, but does not roll back writes after a runtime error; the script checks key types and relevant metadata before writing.
 
 **Redis reconnect and readiness.** Connection events are logged. Startup pings Redis with a 10 second timeout and exits with code 1 if unreachable; Compose restarts the container. After startup, a disconnect does not exit the process; ioredis keeps retrying and `/health/ready` returns `503` until Redis answers a ping within one second. `/health/live` never touches Redis, so an outage does not restart healthy processes.
 
@@ -126,7 +126,9 @@ Logs are Pino JSON on stdout with `service` and `role` on every line. `pino-http
 
 Node.js runtime metrics (event loop lag, heap, GC) are included. Successful `GET /admin/queues/**` requests (Bull Board polls every few seconds) are logged at `debug` instead of `info`; errors on them are still `warn`/`error`.
 
-**Distributed tracing (optional).** With `OTEL_ENABLED=true` the process registers the OpenTelemetry SDK with an OTLP/HTTP exporter (`OTEL_EXPORTER_OTLP_ENDPOINT`, default `http://localhost:4318`; the standard `OTEL_EXPORTER_OTLP_*` variables such as headers also apply). Each HTTP request becomes a `SERVER` span named after its route; the W3C `traceparent` is accepted from clients, stored in the job `meta`, and every task attempt runs in a `CONSUMER` span that continues the same trace, so one trace covers HTTP → queue → worker. Log lines inside a span carry `traceId` and `spanId`. With tracing disabled (the default) the SDK is not loaded and the instrumentation is a no-op, so no collector is needed.
+`tasks_dead_lettered_total` is read from the routing process's Redis counter at scrape time, so it remains a per-instance counter suitable for aggregation across workers. Its increment is part of the routing script, not a separate in-memory update. Counter keys expire 30 days after their last write or successful scrape; a process restart creates a new counter, as with the other process-local counters. A Redis read failure fails the metrics scrape.
+
+**Distributed tracing (optional).** The SDK is loaded only when `OTEL_ENABLED=true` **and** `OTEL_EXPORTER_OTLP_ENDPOINT` is set; otherwise tracing is a no-op. The OTLP/HTTP exporter appends `/v1/traces` to that base URL; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` overrides the full trace URL and the standard exporter header variables apply. `OTEL_SERVICE_NAME` overrides `SERVICE_NAME` for traces. HTTP spans include `request.id`, and task requests add `tenant.id`, `task.id`, and `task.type`. An enqueue producer span injects W3C `traceparent` and `tracestate` into job metadata; each worker attempt creates a consumer span, with a billing child span for invoices and a DLQ child span for failed attempts. The worker span records its observed `circuit_breaker.state`. If the BullMQ failure callback receives a different job object, the DLQ span instead links to the stored producer context. Log lines inside active spans carry `traceId`, `spanId`, and the existing request ID. Retried jobs each create their own attempt span; idempotent replays retain the first job's context.
 
 ## Configuration
 
@@ -152,13 +154,14 @@ Node.js runtime metrics (event loop lag, heap, GC) are included. Successful `GET
 | `AUDIT_LOG_MAX_ENTRIES`                            | `10000`                           | Approximate cap of the admin audit stream in Redis; `0` keeps audit in logs only                                                                        |
 | `TASK_MAX_ATTEMPTS` / `TASK_BACKOFF_DELAY_MS`      | `5` / `2000`                      | Attempts per task (1–50) and base of the exponential backoff (10–600,000 ms)                                                                            |
 | `RATE_LIMIT_TENANT_MAX`                            | `0`                               | Requests per tenant per `RATE_LIMIT_WINDOW_MS`, shared through Redis; `0` disables                                                                      |
-| `OTEL_ENABLED` / `OTEL_EXPORTER_OTLP_ENDPOINT`     | `false` / —                       | Optional OpenTelemetry tracing over OTLP/HTTP                                                                                                           |
+| `OTEL_ENABLED` / `OTEL_EXPORTER_OTLP_ENDPOINT`     | `false` / —                       | Both are required to enable OpenTelemetry tracing over OTLP/HTTP                                                                                        |
+| `OTEL_SERVICE_NAME`                                | `SERVICE_NAME`                    | Service name on exported traces                                                                                                                         |
 | `METRICS_ENABLED`                                  | `true`                            |                                                                                                                                                         |
 | `LOG_LEVEL` / `SERVICE_NAME`                       | `info` / `distributed-task-queue` |                                                                                                                                                         |
 
 ## What Is Not Implemented
 
-There is no transactional outbox: the API writes to Redis only, so there is nothing to keep consistent with. API keys are static configuration: there is no self-service key issuance, no automatic expiry (rotate by adding the new key under the same tenant and removing the old one), and no admin RBAC/SSO beyond one Basic-auth operator. The idempotency window ends when BullMQ's retention removes the job. Results live only as long as that retention. Timeouts are per process; the circuit is shared in Redis. The dead-letter copy is not atomic with the failure (see above). The audit stream is capped and lives in the same Redis; for tamper-evident, long-term retention ship the `audit: true` log lines to external storage. The billing service is a mock and notifications are not sent. Redis Sentinel/Cluster, a secrets manager, immutable SIEM export and Helm/Kubernetes manifests remain future work.
+There is no transactional outbox: the API writes to Redis only, so there is nothing to keep consistent with. API keys are static configuration: there is no self-service key issuance, no automatic expiry (rotate by adding the new key under the same tenant and removing the old one), and no admin RBAC/SSO beyond one Basic-auth operator. The idempotency window ends when BullMQ's retention removes the job. Results live only as long as that retention. Timeouts are per process; the circuit is shared in Redis and counts consecutive completions rather than failures in a rolling time window. The dead-letter copy is not atomic with the failure (see above). The audit stream is capped and lives in the same Redis; for tamper-evident, long-term retention ship the `audit: true` log lines to external storage. The billing service is a mock and notifications are not sent. Redis Sentinel/Cluster, a secrets manager, immutable SIEM export and Helm/Kubernetes manifests remain future work.
 
 ## Testing Strategy
 
@@ -166,25 +169,27 @@ There are two Vitest suites and both run in CI.
 
 **Unit suite** (`npm test`, `npm run test:coverage`): Node environment with `NODE_ENV=test` and `LOG_LEVEL=silent`; `.env` is never loaded while Vitest runs. Redis and the queues are replaced with `vi.mock` stubs, so no test opens a connection. Coverage (V8) is enforced at 85% lines and statements, 83% functions and 78% branches over `src/` (`src/index.ts`, the process wiring, is covered by the integration and Docker smoke tests instead); the run fails below those thresholds. The HTML report lands in `coverage/`.
 
-| Suite                           | Covers                                                                                                                                                                                                                                                     |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tests/task.test.ts`            | Full app via Supertest: validation, all three task types, idempotent replay and `409`, malformed key and JSON, `413`, queue failure `500`, status and dead-letter fallback, API key `401`, tenant isolation, key rotation (`tenant:key`), per-tenant quota |
-| `tests/task.processor.test.ts`  | Worker handler: results, retryable billing error, `UnrecoverableError`, timeout with aborted signal, breaker short-circuit                                                                                                                                 |
-| `tests/circuit-breaker.test.ts` | Threshold, success reset, single half-open probe, reopen on failed probe                                                                                                                                                                                   |
-| `tests/operations.test.ts`      | Health, metrics, roles, admin `503`/`401`/`200`, lockout `429`, dead-letter list/replay/delete with their audit records (no secrets), audit endpoint auth, rate limit, dead-letter routing                                                                 |
-| `tests/observability.test.ts`   | Trace propagation HTTP → job meta → worker span; audit log lines, Redis stream persistence and error tolerance                                                                                                                                             |
-| `tests/bootstrap.test.ts`       | Shutdown ordering, error tolerance, timeout and single run; server close with keep-alive; readiness checks; Redis rate-limit store                                                                                                                         |
-| `tests/config.test.ts`          | Defaults, invalid values, `API_KEYS` parsing (`tenant:key`, duplicates, length), retry settings                                                                                                                                                            |
+| Suite                             | Covers                                                                                                                                                                                                                                                     |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tests/task.test.ts`              | Full app via Supertest: validation, all three task types, idempotent replay and `409`, malformed key and JSON, `413`, queue failure `500`, status and dead-letter fallback, API key `401`, tenant isolation, key rotation (`tenant:key`), per-tenant quota |
+| `tests/task.processor.test.ts`    | Worker handler: results, retryable billing error, `UnrecoverableError`, timeout with aborted signal, breaker short-circuit                                                                                                                                 |
+| `tests/dead-letter.queue.test.ts` | Routing results, Redis failures and per-process counter reads                                                                                                                                                                                              |
+| `tests/circuit-breaker.test.ts`   | Threshold, success reset, single half-open probe, reopen on failed probe                                                                                                                                                                                   |
+| `tests/operations.test.ts`        | Health, metrics, roles, admin `503`/`401`/`200`, lockout `429`, dead-letter list/replay/delete with their audit records (no secrets), audit endpoint auth, rate limit, dead-letter routing                                                                 |
+| `tests/observability.test.ts`     | Trace propagation HTTP → job meta → worker span; audit log lines, Redis stream persistence and error tolerance                                                                                                                                             |
+| `tests/bootstrap.test.ts`         | Shutdown ordering, error tolerance, timeout and single run; server close with keep-alive; readiness checks; Redis rate-limit store                                                                                                                         |
+| `tests/config.test.ts`            | Defaults, invalid values, `API_KEYS` parsing (`tenant:key`, duplicates, length), retry settings                                                                                                                                                            |
 
 **Integration suite** (`npm run test:integration`, config `vitest.integration.config.ts`): runs the real app, queues and worker against a real Redis, one file at a time, with fast retry settings (3 attempts, 100 ms backoff, breaker threshold 2). Every test starts from an empty database (`FLUSHDB`) and zeroed metrics, so the suite is deterministic. It refuses to start against a Redis that already holds keys (set `TEST_REDIS_ALLOW_FLUSH=true` only for a disposable database) and fails fast with instructions if Redis is unreachable.
 
-| Suite                     | Covers                                                                                                                                                                                                                   |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `health.int.test.ts`      | `/health/live`, `/health/ready`; Redis unresponsive (`CLIENT PAUSE`) → `503` while live stays `200`, then recovery; reconnection after `CLIENT KILL`; `/metrics`; `X-Request-Id` echo                                    |
-| `api.int.test.ts`         | `401` without/with unknown key, tenant isolation and rotated keys, idempotent `202` replay and `409`, per-tenant idempotency, `400` validation, request id stored in the job                                             |
-| `processing.int.test.ts`  | The three task types complete with schema-valid results; retries with measured exponential backoff until `failed`; circuit opens (`circuit_breaker_state` = 2) and later invoices fail without calling billing           |
-| `dead-letter.int.test.ts` | Dead-letter copy with `tenantId` and `requestId`, `tasks_dead_lettered_total`, replay (`202`, new job, read by the original tenant, `404` for others, entry removed), delete, audit records in Redis without credentials |
-| `shutdown.int.test.ts`    | Real HTTP listener: request id propagation, readiness `503` during shutdown, active job drained before Redis closes, ordered steps, new connections refused                                                              |
+| Suite                      | Covers                                                                                                                                                                                                         |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `health.int.test.ts`       | `/health/live`, `/health/ready`; Redis unresponsive (`CLIENT PAUSE`) → `503` while live stays `200`, then recovery; reconnection after `CLIENT KILL`; `/metrics`; `X-Request-Id` echo                          |
+| `api.int.test.ts`          | `401` without/with unknown key, tenant isolation and rotated keys, idempotent `202` replay and `409`, per-tenant idempotency, `400` validation, request id stored in the job                                   |
+| `processing.int.test.ts`   | The three task types complete with schema-valid results; retries with measured exponential backoff until `failed`; circuit opens (`circuit_breaker_state` = 2) and later invoices fail without calling billing |
+| `dead-letter.int.test.ts`  | Concurrent atomic routing and deduplication, counter consistency and key-type errors; dead-letter metadata, replay (`202`, new job, read by the original tenant, `404` for others), delete and audit records   |
+| `coordination.int.test.ts` | Concurrent failure counting and one half-open probe across Redis connections, stale-result fencing, fail-closed behavior and shared API rate limits                                                            |
+| `shutdown.int.test.ts`     | Real HTTP listener: request id propagation, readiness `503` during shutdown, active job drained before Redis closes, ordered steps, new connections refused                                                    |
 
 Run it locally with a disposable Redis on `127.0.0.1:6380`:
 
@@ -236,8 +241,33 @@ Optional profiles:
 ```bash
 docker compose --profile scale-out up --build       # adds a PROCESS_ROLE=worker container
 docker compose --profile scale-out up --build --scale worker=3
-docker compose --profile observability up --build   # adds Prometheus on ${PROMETHEUS_PORT:-9090}
+docker compose --profile observability up --build   # adds Collector, Jaeger, Prometheus and Grafana
 ```
+
+The observability profile does not itself enable tracing on existing app/worker containers. With `REDIS_PASSWORD` and `API_KEYS` configured as above, enable tracing and recreate them in PowerShell:
+
+```powershell
+$env:OTEL_ENABLED = 'true'
+$env:OTEL_EXPORTER_OTLP_ENDPOINT = 'http://otel-collector:4318'
+docker compose --profile observability --profile scale-out up -d --build
+```
+
+The Collector accepts OTLP gRPC at `localhost:4317` and HTTP at `localhost:4318`; Jaeger is at `http://localhost:16686`, Prometheus at `http://localhost:9090`, and Grafana at `http://localhost:3001`. Ports are configurable in `.env.example`. The Collector, Jaeger and Grafana ports bind to loopback; the existing Prometheus port remains exposed on the host. Grafana provisions Prometheus, Jaeger and the **Distributed task queue** dashboard automatically. The local-only Grafana default is `admin` / `local-observability-only`: set `GRAFANA_ADMIN_USER` and a strong `GRAFANA_ADMIN_PASSWORD` before use. Jaeger and the Collector have no authentication; this profile is for local development, not an exposed production deployment.
+
+To send a task with a known sampled trace ID and open its trace and dashboard:
+
+```powershell
+$key = Read-Host 'API key (without tenant prefix)'
+$traceId = [Guid]::NewGuid().ToString('N')
+$headers = @{ 'X-API-Key' = $key; 'traceparent' = "00-$traceId-0123456789abcdef-01" }
+$body = '{"type":"PROCESS_DOCUMENT","documentId":"demo","content":"observability test"}'
+Invoke-RestMethod -Method Post -Uri 'http://localhost:3000/api/v1/tasks/process' -Headers $headers -ContentType 'application/json' -Body $body
+Start-Sleep -Seconds 10 # allow the SDK and Collector batches to export
+Start-Process "http://localhost:16686/trace/$traceId"
+Start-Process 'http://localhost:3001/d/queue-engine'
+```
+
+Jaeger also supports searching service `OTEL_SERVICE_NAME` (or `SERVICE_NAME`). A successful document trace shows HTTP, enqueue and worker spans; use an invoice to see billing, and a terminally failed job to see DLQ routing. Grafana's rates require at least two Prometheus scrapes, so new panels may initially show no data. Queue-depth queries use `max` across replicas because every process reads the same Redis queue. Circuit gauges show each process's last observed state, not a live consensus.
 
 The app image never reads `REDIS_URL` from `.env`; Compose blanks it and points the containers at the in-network Redis. Do not commit real Redis credentials, API keys, or the admin password.
 

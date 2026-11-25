@@ -1,6 +1,6 @@
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
 import { config } from '../config/env.js';
-import { deadLetterQueue } from '../queues/dead-letter.queue.js';
+import { deadLetterQueue, readDeadLetterCounts } from '../queues/dead-letter.queue.js';
 import { taskQueue } from '../queues/task.queue.js';
 import type { CircuitState } from '../resilience/circuit-breaker.js';
 
@@ -43,6 +43,17 @@ export const tasksDeadLetteredTotal = new Counter({
   help: 'Tasks moved to the dead-letter queue after their final failure',
   labelNames: ['task_type'] as const,
   registers: [metricsRegistry],
+  async collect() {
+    const counts = await readDeadLetterCounts();
+    this.reset();
+    for (const [taskType, value] of Object.entries(counts)) {
+      const count = Number(value);
+      if (!Number.isSafeInteger(count) || count < 0) {
+        throw new Error(`Invalid dead-letter count for ${taskType}`);
+      }
+      this.inc({ task_type: taskType }, count);
+    }
+  },
 });
 
 const circuitStateValue: Record<CircuitState, number> = { closed: 0, 'half-open': 1, open: 2 };

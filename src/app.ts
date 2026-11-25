@@ -75,6 +75,14 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
     pinoHttp<Request, Response>({
       logger,
       genReqId: (_request, response) => getRequestId(response.locals),
+      customSuccessObject: (_request, response, fields: Record<string, unknown>) => ({
+        ...fields,
+        requestId: getRequestId(response.locals),
+      }),
+      customErrorObject: (_request, response, _error, fields: Record<string, unknown>) => ({
+        ...fields,
+        requestId: getRequestId(response.locals),
+      }),
       autoLogging: {
         ignore: (request) => request.url.startsWith('/health') || request.url === '/metrics',
       },

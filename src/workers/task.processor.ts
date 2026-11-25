@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import { UnrecoverableError, type Job } from 'bullmq';
+import { SpanKind } from '@opentelemetry/api';
 import type { Logger } from 'pino';
 import type { BillingGateway } from '../services/billing.mock.service.js';
 import { withTimeout } from '../resilience/timeout.js';
-import { withJobSpan } from '../observability/tracing.js';
+import { rememberJobAttempt, withJobSpan, withSpan } from '../observability/tracing.js';
 import {
   taskPayloadSchema,
   type TaskJobData,
@@ -46,25 +47,27 @@ export const createTaskProcessor =
       requestId: job.data.meta?.requestId,
     });
 
-    // The API validated this payload, but Redis is a trust boundary: a malformed job
-    // (manual insert, schema drift between deploys) must fail once instead of retrying.
-    const parsed = taskPayloadSchema.safeParse(job.data);
-    if (!parsed.success) {
-      const reason = parsed.error.issues
-        .map(({ path, message }) => `${path.join('.')}: ${message}`)
-        .join('; ');
-      log.error({ reason }, 'Rejecting job with invalid payload');
-      throw new UnrecoverableError(`Invalid task payload: ${reason}`);
-    }
-    const payload = parsed.data;
-
     const span = {
       'messaging.message.id': job.id ?? '',
+      'task.id': job.id ?? '',
       'task.type': job.name,
       'task.attempt': attempt,
+      ...(job.data.meta?.requestId ? { 'request.id': job.data.meta.requestId } : {}),
+      ...(job.data.meta?.tenantId ? { 'tenant.id': job.data.meta.tenantId } : {}),
     };
-    return withJobSpan(`process ${job.name}`, job.data.meta, span, () =>
-      withTimeout(async (signal) => {
+    return withJobSpan(`process ${job.name}`, job.data.meta, span, () => {
+      rememberJobAttempt(job);
+      // Redis is a trust boundary: invalid jobs fail once rather than being retried.
+      const parsed = taskPayloadSchema.safeParse(job.data);
+      if (!parsed.success) {
+        const reason = parsed.error.issues
+          .map(({ path, message }) => `${path.join('.')}: ${message}`)
+          .join('; ');
+        log.error({ reason }, 'Rejecting job with invalid payload');
+        throw new UnrecoverableError(`Invalid task payload: ${reason}`);
+      }
+      const payload = parsed.data;
+      return withTimeout(async (signal) => {
         switch (payload.type) {
           case 'PROCESS_DOCUMENT': {
             const result = processDocument(payload);
@@ -84,7 +87,9 @@ export const createTaskProcessor =
             log.info({ customerId: payload.customerId }, 'Invoice processing started');
             try {
               const result = await dependencies.billingCircuit.execute(() =>
-                dependencies.billing.processInvoice(payload, signal),
+                withSpan('billing.processInvoice', SpanKind.CLIENT, {}, () =>
+                  dependencies.billing.processInvoice(payload, signal),
+                ),
               );
               log.info(
                 { customerId: payload.customerId, invoiceId: result.invoiceId },
@@ -100,6 +105,6 @@ export const createTaskProcessor =
             }
           }
         }
-      }, dependencies.timeoutMs),
-    );
+      }, dependencies.timeoutMs);
+    });
   };

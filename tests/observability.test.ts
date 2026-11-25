@@ -11,7 +11,7 @@ import pino from 'pino';
 import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({ add: vi.fn() }));
+const mocks = vi.hoisted(() => ({ add: vi.fn(), addDeadLetter: vi.fn() }));
 
 vi.mock('../src/config/redis.js', () => ({ redis: {}, pingRedis: vi.fn() }));
 vi.mock('../src/queues/task.queue.js', () => ({
@@ -25,6 +25,8 @@ vi.mock('../src/queues/task.queue.js', () => ({
   },
 }));
 vi.mock('../src/queues/dead-letter.queue.js', () => ({
+  addDeadLetter: mocks.addDeadLetter,
+  readDeadLetterCounts: vi.fn(async () => ({})),
   deadLetterJobId: (id: string) => `dlq-${id}`,
   deadLetterQueue: {
     name: 'tasks-dead-letter',
@@ -40,8 +42,17 @@ vi.mock('../src/routes/board.routes.js', async () => {
 import { createApp } from '../src/app.js';
 import { loadConfig } from '../src/config/env.js';
 import { createAuditLog } from '../src/observability/audit.js';
-import { withJobSpan } from '../src/observability/tracing.js';
+import {
+  activeTraceFields,
+  currentTraceContext,
+  initTracing,
+  jobAttemptContext,
+  withTraceContext,
+} from '../src/observability/tracing.js';
+import { RedisCircuitBreaker } from '../src/resilience/redis-circuit-breaker.js';
 import type { TaskJobMeta } from '../src/types/task.types.js';
+import { createTaskProcessor, type TaskJob } from '../src/workers/task.processor.js';
+import { routeToDeadLetter } from '../src/workers/task.worker.js';
 
 describe('distributed tracing', () => {
   const exporter = new InMemorySpanExporter();
@@ -63,32 +74,147 @@ describe('distributed tracing', () => {
 
   it('continues the inbound trace through the job meta into the worker span', async () => {
     mocks.add.mockResolvedValue({ id: 'job-1' });
-    const app = await createApp({ config: loadConfig({ NODE_ENV: 'test', LOG_LEVEL: 'silent' }) });
+    const key = 'k'.repeat(32);
+    const app = await createApp({
+      config: loadConfig({ NODE_ENV: 'test', LOG_LEVEL: 'silent', API_KEYS: `acme:${key}` }),
+    });
     const traceId = '4bf92f3577b34da6a3ce929d0e0e4736';
 
     const response = await request(app)
       .post('/api/v1/tasks/process')
       .set('traceparent', `00-${traceId}-00f067aa0ba902b7-01`)
+      .set('tracestate', 'vendor=value')
+      .set('X-API-Key', key)
+      .set('X-Request-Id', 'trace-request')
       .send({ type: 'PROCESS_DOCUMENT', documentId: 'd-1', content: 'traced' });
     expect(response.status).toBe(202);
 
     const meta = (mocks.add.mock.calls[0]?.[1] as { meta: TaskJobMeta }).meta;
     expect(meta.traceparent).toMatch(new RegExp(`^00-${traceId}-[0-9a-f]{16}-01$`, 'u'));
+    expect(meta.tracestate).toBe('vendor=value');
 
-    await withJobSpan(
-      'process PROCESS_DOCUMENT',
-      meta,
-      { 'task.type': 'PROCESS_DOCUMENT' },
-      async () => 'ok',
-    );
+    const lines: string[] = [];
+    const sink = new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        lines.push(chunk.toString());
+        callback();
+      },
+    });
+    const processor = createTaskProcessor({
+      logger: pino({ mixin: activeTraceFields }, sink),
+      timeoutMs: 1_000,
+      billing: { processInvoice: vi.fn() },
+      billingCircuit: { execute: async (operation) => operation() },
+    });
+    const data = mocks.add.mock.calls[0]?.[1] as TaskJob['data'];
+    const job = {
+      id: 'job-1',
+      name: 'PROCESS_DOCUMENT',
+      attemptsMade: 0,
+      data,
+    } as unknown as TaskJob;
+    await processor(job);
+    mocks.addDeadLetter.mockResolvedValueOnce(true);
+    await routeToDeadLetter(job, new Error('test failure'));
 
     const spans = exporter.getFinishedSpans();
     const server = spans.find((span) => span.name === 'POST /api/v1/tasks/process');
+    const producer = spans.find((span) => span.name === 'enqueue task');
     const consumer = spans.find((span) => span.name === 'process PROCESS_DOCUMENT');
+    const deadLetter = spans.find((span) => span.name === 'dead-letter.route');
     expect(server?.spanContext().traceId).toBe(traceId);
     expect(server?.attributes['http.response.status_code']).toBe(202);
     expect(consumer?.spanContext().traceId).toBe(traceId);
-    expect(consumer?.parentSpanContext?.spanId).toBe(server?.spanContext().spanId);
+    expect(producer?.parentSpanContext?.spanId).toBe(server?.spanContext().spanId);
+    expect(consumer?.parentSpanContext?.spanId).toBe(producer?.spanContext().spanId);
+    expect(deadLetter?.parentSpanContext?.spanId).toBe(consumer?.spanContext().spanId);
+    expect(deadLetter?.attributes['dead_letter.routed']).toBe(true);
+    expect(server?.attributes).toMatchObject({
+      'request.id': 'trace-request',
+      'tenant.id': 'acme',
+      'task.id': 'job-1',
+    });
+    expect(consumer?.attributes).toMatchObject({
+      'request.id': 'trace-request',
+      'tenant.id': 'acme',
+      'task.id': 'job-1',
+      'task.type': 'PROCESS_DOCUMENT',
+    });
+    expect(JSON.parse(lines[0] ?? '{}')).toMatchObject({
+      requestId: 'trace-request',
+      traceId,
+      spanId: consumer?.spanContext().spanId,
+    });
+    expect(withTraceContext(jobAttemptContext(job), activeTraceFields)).toEqual({
+      traceId,
+      spanId: consumer?.spanContext().spanId,
+    });
+  });
+
+  it('records the shared circuit state and a child span for billing', async () => {
+    const breaker = new RedisCircuitBreaker({
+      redis: {
+        eval: vi
+          .fn()
+          .mockResolvedValueOnce(['closed', 'generation', 0, 1])
+          .mockResolvedValueOnce('closed'),
+      },
+      key: 'test',
+      name: 'billing',
+      failureThreshold: 1,
+      resetTimeoutMs: 1_000,
+      probeLeaseMs: 1_000,
+    });
+    const processor = createTaskProcessor({
+      logger: pino({ level: 'silent' }),
+      timeoutMs: 1_000,
+      billingCircuit: breaker,
+      billing: {
+        processInvoice: async () => ({
+          taskType: 'PROCESS_INVOICE',
+          invoiceId: '6a4b3f1e-1d2c-4b5a-8c7d-9e0f1a2b3c4d',
+          status: 'PAID',
+          pdfUrl: 'https://billing.example.test/invoice',
+          processedAt: '2026-01-01T00:00:00.000Z',
+        }),
+      },
+    });
+    await processor({
+      id: 'invoice-1',
+      name: 'PROCESS_INVOICE',
+      attemptsMade: 0,
+      data: {
+        type: 'PROCESS_INVOICE',
+        customerId: 'customer',
+        amount: 10,
+        currency: 'USD',
+        taxId: 'tax',
+        items: [{ description: 'item', quantity: 1, unitPrice: 10 }],
+      },
+    } as unknown as TaskJob);
+    const spans = exporter.getFinishedSpans();
+    const consumer = spans.find((span) => span.name === 'process PROCESS_INVOICE');
+    const billing = spans.find((span) => span.name === 'billing.processInvoice');
+    expect(consumer?.attributes['circuit_breaker.state']).toBe('closed');
+    expect(billing?.parentSpanContext?.spanId).toBe(consumer?.spanContext().spanId);
+  });
+});
+
+describe('tracing disabled', () => {
+  it('does not initialize the SDK without an endpoint or when disabled', async () => {
+    await expect(
+      initTracing({ enabled: true, serviceName: 'test', role: 'worker' }),
+    ).resolves.toBeUndefined();
+    await expect(
+      initTracing({
+        enabled: false,
+        endpoint: 'http://localhost:4318',
+        serviceName: 'test',
+        role: 'worker',
+      }),
+    ).resolves.toBeUndefined();
+    expect(activeTraceFields()).toEqual({});
+    expect(currentTraceContext()).toEqual({});
   });
 });
 

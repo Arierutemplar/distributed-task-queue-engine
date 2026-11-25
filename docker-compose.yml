@@ -4,7 +4,7 @@
 #
 #   docker compose up --build                         # redis + app
 #   docker compose --profile scale-out up --build     # + dedicated worker-only container
-#   docker compose --profile observability up --build # + Prometheus on :9090
+#   docker compose --profile observability up --build # + Collector, Jaeger, Prometheus and Grafana
 
 x-app-environment: &app-environment
   REDIS_URL: ''
@@ -23,9 +23,10 @@ x-app-environment: &app-environment
   SERVICE_NAME: ${SERVICE_NAME:-distributed-task-queue}
   METRICS_ENABLED: ${METRICS_ENABLED:-true}
   TRUST_PROXY: ${TRUST_PROXY:-0}
-  # Optional tracing: off unless OTEL_ENABLED=true and a collector is reachable.
+  # Optional tracing requires both OTEL_ENABLED=true and an explicit collector endpoint.
   OTEL_ENABLED: ${OTEL_ENABLED:-false}
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-}
 
 x-app-healthcheck: &app-healthcheck
   test:
@@ -72,7 +73,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: distributed-task-queue:local
+    image: ${APP_IMAGE:-distributed-task-queue:local}
     environment:
       <<: *app-environment
       PORT: '3000'
@@ -104,7 +105,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: distributed-task-queue:local
+    image: ${APP_IMAGE:-distributed-task-queue:local}
     environment:
       <<: *app-environment
       PORT: '3000'
@@ -134,6 +135,51 @@ services:
     depends_on:
       app:
         condition: service_healthy
+    restart: unless-stopped
+
+  otel-collector:
+    profiles: ['observability']
+    image: otel/opentelemetry-collector:0.116.1
+    command: ['--config=/etc/otelcol/config.yaml']
+    volumes:
+      - ./ops/otel/collector.yml:/etc/otelcol/config.yaml:ro
+    ports:
+      - '127.0.0.1:${OTEL_GRPC_PORT:-4317}:4317'
+      - '127.0.0.1:${OTEL_HTTP_PORT:-4318}:4318'
+    networks:
+      - queue-net
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  jaeger:
+    profiles: ['observability']
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    ports:
+      - '127.0.0.1:${JAEGER_PORT:-16686}:16686'
+    networks:
+      - queue-net
+    restart: unless-stopped
+
+  grafana:
+    profiles: ['observability']
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-local-observability-only}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    ports:
+      - '127.0.0.1:${GRAFANA_PORT:-3001}:3000'
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - queue-net
+    depends_on:
+      - prometheus
+      - jaeger
     restart: unless-stopped
 
 networks:

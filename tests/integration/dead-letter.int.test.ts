@@ -4,7 +4,12 @@ import type { Express } from 'express';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { redis } from '../../src/config/redis.js';
 import type { AuditRecord } from '../../src/observability/audit.js';
-import { deadLetterJobId, deadLetterQueue } from '../../src/queues/dead-letter.queue.js';
+import {
+  addDeadLetter,
+  deadLetterJobId,
+  deadLetterQueue,
+} from '../../src/queues/dead-letter.queue.js';
+import { taskQueue } from '../../src/queues/task.queue.js';
 import { BillingServiceException } from '../../src/services/billing.mock.service.js';
 import type { TaskJobData, TaskResult, TaskType } from '../../src/types/task.types.js';
 import { createTaskWorker } from '../../src/workers/task.worker.js';
@@ -106,6 +111,94 @@ describe('dead-letter queue and admin audit against a real Redis', () => {
         },
       ],
     });
+  });
+
+  it('atomically deduplicates concurrent workers, including after an entry is deleted', async () => {
+    const taskId = await deadLetteredInvoice();
+    const entry = await deadLetterQueue.getJob(deadLetterJobId(taskId));
+    if (!entry) throw new Error('Expected dead-letter entry');
+    const data = entry.data;
+    await entry.remove();
+    await redis.hdel(taskQueue.toKey(taskId), 'dtqDlqRouted');
+
+    const clients = Array.from({ length: 8 }, () => redis.duplicate({ lazyConnect: true }));
+    try {
+      await Promise.all(clients.map((client) => client.connect()));
+      const results = await Promise.all(
+        Array.from({ length: 64 }, (_, index) =>
+          addDeadLetter(data, clients[index % clients.length]),
+        ),
+      );
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(await deadLetterQueue.getWaitingCount()).toBe(1);
+      expect(await deadLetterQueue.getJob(deadLetterJobId(taskId))).toMatchObject({ data });
+      expect(await metricValue('tasks_dead_lettered_total', { task_type: 'PROCESS_INVOICE' })).toBe(
+        2,
+      );
+
+      const removed = await admin('delete', `/admin/api/dead-letter/${taskId}`);
+      expect(removed.status).toBe(204);
+      expect(await addDeadLetter(data)).toBe(false);
+      expect(await deadLetterQueue.getWaitingCount()).toBe(0);
+      expect(await metricValue('tasks_dead_lettered_total', { task_type: 'PROCESS_INVOICE' })).toBe(
+        2,
+      );
+      const nextFailure = {
+        ...data,
+        failedAt: new Date(Date.parse(data.failedAt) + 1_000).toISOString(),
+        attemptsMade: data.attemptsMade + 1,
+      };
+      await redis.hset(
+        taskQueue.toKey(taskId),
+        'finishedOn',
+        String(Date.parse(nextFailure.failedAt)),
+        'atm',
+        String(nextFailure.attemptsMade),
+      );
+      expect(await addDeadLetter(data)).toBe(false);
+      expect(await addDeadLetter(nextFailure)).toBe(true);
+      expect(await metricValue('tasks_dead_lettered_total', { task_type: 'PROCESS_INVOICE' })).toBe(
+        3,
+      );
+    } finally {
+      await Promise.all(clients.map((client) => client.quit()));
+    }
+  });
+
+  it('does not partially route a job when a queue key has the wrong type', async () => {
+    const taskId = await deadLetteredInvoice();
+    const entry = await deadLetterQueue.getJob(deadLetterJobId(taskId));
+    if (!entry) throw new Error('Expected dead-letter entry');
+    const data = entry.data;
+    await entry.remove();
+    await redis.hdel(taskQueue.toKey(taskId), 'dtqDlqRouted');
+    await redis.del(deadLetterQueue.toKey('events'));
+    await redis.set(deadLetterQueue.toKey('events'), 'invalid');
+
+    await expect(addDeadLetter(data)).rejects.toThrow('Unexpected Redis key type');
+    expect(await deadLetterQueue.getJob(deadLetterJobId(taskId))).toBeUndefined();
+    expect(await redis.hget(taskQueue.toKey(taskId), 'dtqDlqRouted')).toBeNull();
+    expect(await metricValue('tasks_dead_lettered_total', { task_type: 'PROCESS_INVOICE' })).toBe(
+      1,
+    );
+  });
+
+  it('rejects a corrupt counter before writing the job or its deduplication marker', async () => {
+    const taskId = await deadLetteredInvoice();
+    const entry = await deadLetterQueue.getJob(deadLetterJobId(taskId));
+    if (!entry) throw new Error('Expected dead-letter entry');
+    const data = entry.data;
+    await entry.remove();
+    await redis.hdel(taskQueue.toKey(taskId), 'dtqDlqRouted');
+    const keys = await redis.keys(deadLetterQueue.toKey('routed-metrics-*'));
+    expect(keys).toHaveLength(1);
+    const key = keys[0];
+    await redis.hset(key, 'PROCESS_INVOICE', '00');
+
+    await expect(addDeadLetter(data)).rejects.toThrow('Invalid dead-letter counter');
+    expect(await deadLetterQueue.getJob(deadLetterJobId(taskId))).toBeUndefined();
+    expect(await redis.hget(taskQueue.toKey(taskId), 'dtqDlqRouted')).toBeNull();
+    expect(await redis.hget(key, 'PROCESS_INVOICE')).toBe('00');
   });
 
   it('replays into a new job owned by the original tenant and removes the dead-letter entry', async () => {

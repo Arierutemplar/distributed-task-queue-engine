@@ -1,0 +1,94 @@
+{
+  "uid": "queue-engine",
+  "title": "Distributed task queue",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Accepted tasks / second",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task_type) (rate(tasks_enqueued_total{replayed=\"false\"}[5m]))",
+          "legendFormat": "{{task_type}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Completed and failed attempts / second",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task_type, outcome) (rate(tasks_processed_total[5m]))",
+          "legendFormat": "{{task_type}} / {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Task processing latency p95 (seconds)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, task_type) (rate(task_processing_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{task_type}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Queue depth",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (queue, state) (queue_jobs)",
+          "legendFormat": "{{queue}} / {{state}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Dead letters / second",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task_type) (rate(tasks_dead_lettered_total[5m]))",
+          "legendFormat": "{{task_type}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Circuit state (0 closed, 1 half-open, 2 open)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "circuit_breaker_state",
+          "legendFormat": "{{circuit}} / {{instance}}"
+        }
+      ]
+    }
+  ]
+}

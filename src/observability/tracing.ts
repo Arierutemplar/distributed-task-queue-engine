@@ -11,11 +11,13 @@ import type { RequestHandler } from 'express';
 import type { TaskJobMeta } from '../types/task.types.js';
 
 // Without a registered provider every call below is a cheap no-op, so tracing stays
-// non-intrusive until OTEL_ENABLED=true.
+// non-intrusive until tracing is enabled with an explicit endpoint.
 const tracer = trace.getTracer('distributed-task-queue');
+const jobAttemptContexts = new WeakMap<object, Pick<TaskJobMeta, 'traceparent' | 'tracestate'>>();
 
 export interface TracingSettings {
   enabled: boolean;
+  endpoint?: string;
   serviceName: string;
   role: string;
 }
@@ -28,7 +30,7 @@ export interface TracingHandle {
 export const initTracing = async (
   settings: TracingSettings,
 ): Promise<TracingHandle | undefined> => {
-  if (!settings.enabled) {
+  if (!settings.enabled || !settings.endpoint) {
     return undefined;
   }
   const [
@@ -45,13 +47,21 @@ export const initTracing = async (
     import('@opentelemetry/semantic-conventions'),
   ]);
 
+  const endpoint = new URL(settings.endpoint);
+  endpoint.pathname = `${endpoint.pathname.replace(/\/+$/u, '')}/v1/traces`;
+  const tracesEndpoint = process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
   const provider = new NodeTracerProvider({
     resource: resourceFromAttributes({
       [ATTR_SERVICE_NAME]: settings.serviceName,
       'service.role': settings.role,
     }),
-    // The exporter reads OTEL_EXPORTER_OTLP_ENDPOINT / _HEADERS (default http://localhost:4318).
-    spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter())],
+    spanProcessors: [
+      new BatchSpanProcessor(
+        new OTLPTraceExporter({
+          url: tracesEndpoint?.trim() ? tracesEndpoint : endpoint.toString(),
+        }),
+      ),
+    ],
   });
   // Installs the AsyncLocalStorage context manager and the W3C trace-context propagator.
   provider.register();
@@ -65,7 +75,13 @@ export const traceRequests: RequestHandler = (request, response, next) => {
     `${request.method} ${request.baseUrl || request.path}`,
     {
       kind: SpanKind.SERVER,
-      attributes: { 'http.request.method': request.method, 'url.path': request.path },
+      attributes: {
+        'http.request.method': request.method,
+        'url.path': request.path,
+        ...(typeof response.locals.requestId === 'string'
+          ? { 'request.id': response.locals.requestId }
+          : {}),
+      },
     },
     parent,
   );
@@ -95,34 +111,66 @@ export const currentTraceContext = (): Pick<TaskJobMeta, 'traceparent' | 'traces
   };
 };
 
-/** Runs a job attempt inside a consumer span whose parent is the stored trace context. */
-export const withJobSpan = <T>(
-  name: string,
-  meta: TaskJobMeta | undefined,
-  attributes: Attributes,
-  operation: () => Promise<T>,
-): Promise<T> => {
-  const parent = propagation.extract(ROOT_CONTEXT, {
+export const rememberJobAttempt = (job: object): void => {
+  const carrier = currentTraceContext();
+  if (carrier.traceparent) jobAttemptContexts.set(job, carrier);
+};
+
+export const jobAttemptContext = (
+  job: object,
+): Pick<TaskJobMeta, 'traceparent' | 'tracestate'> | undefined => jobAttemptContexts.get(job);
+
+const extractJobContext = (meta: Pick<TaskJobMeta, 'traceparent' | 'tracestate'> | undefined) =>
+  propagation.extract(ROOT_CONTEXT, {
     ...(meta?.traceparent ? { traceparent: meta.traceparent } : {}),
     ...(meta?.tracestate ? { tracestate: meta.tracestate } : {}),
   });
-  return tracer.startActiveSpan(
-    name,
-    { kind: SpanKind.CONSUMER, attributes },
-    parent,
-    async (span) => {
-      try {
-        return await operation();
-      } catch (error: unknown) {
-        span.recordException(error instanceof Error ? error : String(error));
-        span.setStatus({ code: SpanStatusCode.ERROR });
-        throw error;
-      } finally {
-        span.end();
-      }
-    },
-  );
+
+export const withTraceContext = <T>(
+  meta: Pick<TaskJobMeta, 'traceparent' | 'tracestate'> | undefined,
+  operation: () => T,
+): T => context.with(extractJobContext(meta), operation);
+
+/** Runs a job attempt inside a consumer span whose parent is the stored trace context. */
+export const withJobSpan = <T>(
+  name: string,
+  meta: Pick<TaskJobMeta, 'traceparent' | 'tracestate'> | undefined,
+  attributes: Attributes,
+  operation: () => Promise<T>,
+  kind: SpanKind = SpanKind.CONSUMER,
+): Promise<T> => {
+  const parent = extractJobContext(meta);
+  return tracer.startActiveSpan(name, { kind, attributes }, parent, async (span) => {
+    try {
+      return await operation();
+    } catch (error: unknown) {
+      span.recordException(error instanceof Error ? error : String(error));
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
 };
+
+/** Runs an operation as a child of the current span. */
+export const withSpan = <T>(
+  name: string,
+  kind: SpanKind,
+  attributes: Attributes,
+  operation: () => Promise<T>,
+): Promise<T> =>
+  tracer.startActiveSpan(name, { kind, attributes }, async (span) => {
+    try {
+      return await operation();
+    } catch (error: unknown) {
+      span.recordException(error instanceof Error ? error : String(error));
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
 
 /** Log correlation fields for the active span, if any. */
 export const activeTraceFields = (): { traceId?: string; spanId?: string } => {
