@@ -30,6 +30,7 @@ export interface DispatchOptions {
   idempotencyKey?: string;
   replayOf?: string;
   effectId?: string;
+  jobId?: string;
   limits?: AdmissionLimits;
 }
 
@@ -47,6 +48,9 @@ export { payloadFingerprint } from './task-fingerprint.js';
 export const idempotentJobId = (tenantId: string, idempotencyKey: string): string =>
   `idem-${sha256(`${tenantId}\n${idempotencyKey}`)}`;
 
+export const replayJobId = (tenantId: string, originalJobId: string): string =>
+  `replay-${sha256(JSON.stringify([tenantId, originalJobId]))}`;
+
 const ownerOf = (meta: TaskJobMeta | undefined): string => meta?.tenantId ?? PUBLIC_TENANT_ID;
 
 const toIso = (epochMs: number | undefined): string | null =>
@@ -61,9 +65,11 @@ export const dispatchTask = async (
     SpanKind.PRODUCER,
     { 'request.id': options.requestId, 'tenant.id': options.tenantId, 'task.type': payload.type },
     async () => {
-      const jobId = options.idempotencyKey
-        ? idempotentJobId(options.tenantId, options.idempotencyKey)
-        : undefined;
+      const jobId =
+        options.jobId ??
+        (options.idempotencyKey
+          ? idempotentJobId(options.tenantId, options.idempotencyKey)
+          : undefined);
       const meta: TaskJobMeta = {
         requestId: options.requestId,
         tenantId: options.tenantId,

@@ -30,6 +30,7 @@ const recordSchema = z.object({
   tenantId: z.string().optional(),
   taskId: z.string().optional(),
   newTaskId: z.string().optional(),
+  operationId: z.string().optional(),
   reason: z.string().optional(),
   id: z.string().optional(),
 });
@@ -118,6 +119,10 @@ export const createAuditOutbox = (
         const data = recordSchema.parse({ ...record, archiveId });
         await queue.add('archive', data, { jobId: archiveId });
         auditDeliveryTotal.inc({ outcome: 'enqueued' });
+        logger.info(
+          { archiveId, operationId: data.operationId },
+          'Audit event queued for WORM archival',
+        );
       } catch (error: unknown) {
         auditDeliveryTotal.inc({ outcome: 'enqueue_failed' });
         logger.error(

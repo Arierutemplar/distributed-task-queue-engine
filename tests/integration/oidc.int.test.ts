@@ -14,7 +14,6 @@ import {
   createIntegrationAuditLog,
   documentPayload,
   resetState,
-  waitFor,
 } from './helpers.js';
 
 let app: Express;
@@ -100,12 +99,7 @@ describe('OIDC RBAC on real administrative routes', () => {
     }
     expect(await deadLetterQueue.getJob('dlq-viewer-job')).toBeDefined();
     expect(await taskQueue.getWaitingCount()).toBe(0);
-    const records = await waitFor(async () => {
-      const items = await audit.list(100);
-      return items.filter((event) => event.action === 'admin.access_denied').length === 5
-        ? items
-        : undefined;
-    }, 'RBAC denials to be persisted');
+    const records = await audit.list(100);
     expect(records.filter((event) => event.action === 'admin.access_denied')).toEqual(
       Array.from({ length: 5 }, () =>
         expect.objectContaining({
@@ -121,6 +115,7 @@ describe('OIDC RBAC on real administrative routes', () => {
       role: 'viewer',
       subject: 'subject-viewer',
     });
+    expect(records.some((event) => event.action === 'admin.bull_board_action')).toBe(false);
   });
 
   it('allows admin reads, replay, delete and mutable Bull Board actions', async () => {
@@ -171,5 +166,23 @@ describe('OIDC RBAC on real administrative routes', () => {
         (await request(app).get('/admin/api/dead-letter').auth(value, { type: 'bearer' })).status,
       ).toBe(401);
     }
+  });
+
+  it('rejects a validly signed token without an administrative role and records the denial', async () => {
+    const unprivileged = await token('other');
+    const response = await request(app)
+      .get('/admin/api/dead-letter?secret=do-not-log')
+      .auth(unprivileged, { type: 'bearer' });
+    expect(response.status).toBe(403);
+    expect(await audit.list(20)).toContainEqual(
+      expect.objectContaining({
+        action: 'admin.access_denied',
+        outcome: 'denied',
+        path: '/admin/api/dead-letter',
+        statusCode: 403,
+      }),
+    );
+    expect(JSON.stringify(await audit.list(20))).not.toContain(unprivileged);
+    expect(JSON.stringify(await audit.list(20))).not.toContain('do-not-log');
   });
 });

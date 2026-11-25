@@ -1,5 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { Router, type CookieOptions, type Request, type RequestHandler } from 'express';
+import {
+  Router,
+  type CookieOptions,
+  type Request,
+  type RequestHandler,
+  type Response,
+} from 'express';
 import {
   createRemoteJWKSet,
   EncryptJWT,
@@ -53,7 +59,10 @@ const isCredentialError = (error: unknown): boolean =>
 
 const random = () => randomBytes(32).toString('base64url');
 
-export const createAdminSecurity = (settings: AppConfig) => {
+export const createAdminSecurity = (
+  settings: AppConfig,
+  onForbidden: (request: Request, response: Response) => Promise<void> = () => Promise.resolve(),
+) => {
   const router = Router();
   if (settings.ADMIN_AUTH_MODE === 'basic') {
     return {
@@ -188,6 +197,7 @@ export const createAdminSecurity = (settings: AppConfig) => {
         typeof payload.preferred_username === 'string' ? payload.preferred_username : payload.sub;
       response.locals.adminRole = resolveAdminRole(payload, settings.OIDC_CLIENT_ID);
       if (!response.locals.adminRole) {
+        await onForbidden(request, response);
         response.status(403).json({ error: 'Forbidden' });
         return;
       }
@@ -258,6 +268,7 @@ export const createAdminSecurity = (settings: AppConfig) => {
         (role === 'viewer' && !read) ||
         (fromSession && !read && request.header('origin') !== origin)
       ) {
+        await onForbidden(request, response);
         response.status(403).json({ error: 'Forbidden' });
         return;
       }

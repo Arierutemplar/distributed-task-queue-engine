@@ -82,6 +82,7 @@ export const envSchema = z
     WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(1_000).default(10),
     QUEUE_MAX_WAITING: z.coerce.number().int().min(0).max(1_000_000).default(0),
     TENANT_MAX_INFLIGHT: z.coerce.number().int().min(0).max(1_000_000).default(0),
+    TENANT_MAX_ACTIVE_SLOTS: z.coerce.number().int().min(0).max(1_000).default(0),
     JOB_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(600_000).default(30_000),
     SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(25_000),
     TASK_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(50).default(5),

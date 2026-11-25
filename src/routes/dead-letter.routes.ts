@@ -1,9 +1,15 @@
 import { Router, type Request, type Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { getAdminActor, getAdminIdentity, getRequestId } from '../middleware/http.middleware.js';
+import {
+  asyncHandler,
+  getAdminActor,
+  getAdminIdentity,
+  getRequestId,
+} from '../middleware/http.middleware.js';
 import type { AuditEvent, AuditLog } from '../observability/audit.js';
 import { deadLetterJobId, deadLetterQueue } from '../queues/dead-letter.queue.js';
-import { dispatchTask } from '../services/task.service.js';
+import { dispatchTask, replayJobId } from '../services/task.service.js';
 import { PUBLIC_TENANT_ID, taskIdSchema, taskPayloadSchema } from '../types/task.types.js';
 import type { AdmissionLimits } from '../queues/admission.js';
 import { BackpressureError } from '../queues/admission.js';
@@ -22,8 +28,9 @@ export const createDeadLetterRouter = (audit: AuditLog): Router => {
     request: Request,
     response: Response,
     details: AuditDetails,
-  ): Promise<void> =>
-    audit.record({
+    options?: { requirePersistence?: boolean },
+  ): Promise<void> => {
+    const event: AuditEvent = {
       actor: getAdminActor(response.locals),
       ...getAdminIdentity(response.locals),
       requestId: getRequestId(response.locals),
@@ -31,158 +38,208 @@ export const createDeadLetterRouter = (audit: AuditLog): Router => {
       path: request.originalUrl.split('?')[0] ?? request.originalUrl,
       ip: request.ip,
       ...details,
-    });
+    };
+    return options ? audit.record(event, options) : audit.record(event);
+  };
 
-  router.get('/', async (request, response, next) => {
-    const parsed = paginationSchema.safeParse(request.query);
-    if (!parsed.success) {
-      response.status(400).json({ error: 'Invalid pagination parameters' });
-      return;
-    }
-    const { limit, offset } = parsed.data;
-
-    try {
-      const [total, jobs] = await Promise.all([
-        deadLetterQueue.getWaitingCount(),
-        deadLetterQueue.getWaiting(offset, offset + limit - 1),
-      ]);
-      await recordAudit(request, response, {
-        action: 'dead_letter.list',
-        outcome: 'success',
-        statusCode: 200,
-      });
-      response.json({
-        total,
-        limit,
-        offset,
-        items: jobs.map((job) => ({
-          taskId: job.data.originalJobId,
-          taskType: job.data.taskType,
-          failedReason: job.data.failedReason,
-          attemptsMade: job.data.attemptsMade,
-          failedAt: job.data.failedAt,
-          requestId: job.data.data.meta?.requestId ?? null,
-          tenantId: job.data.data.meta?.tenantId ?? PUBLIC_TENANT_ID,
-        })),
-      });
-    } catch (error: unknown) {
-      next(error);
-    }
-  });
-
-  router.post('/:taskId/replay', async (request, response, next) => {
-    const action = 'dead_letter.replay';
-    const parsedId = taskIdSchema.safeParse(request.params.taskId);
-    if (!parsedId.success) {
-      await recordAudit(request, response, { action, outcome: 'invalid', statusCode: 400 });
-      response.status(400).json({ error: 'Invalid task id' });
-      return;
-    }
-    const taskId = parsedId.data;
-
-    try {
-      const entry = await deadLetterQueue.getJob(deadLetterJobId(taskId));
-      if (!entry) {
-        await recordAudit(request, response, {
-          action,
-          outcome: 'not_found',
-          statusCode: 404,
-          taskId,
-        });
-        response.status(404).json({ error: 'Dead-letter entry not found' });
+  router.get(
+    '/',
+    asyncHandler(async (request, response, next) => {
+      const parsed = paginationSchema.safeParse(request.query);
+      if (!parsed.success) {
+        response.status(400).json({ error: 'Invalid pagination parameters' });
         return;
       }
-      const tenantId = entry.data.data.meta?.tenantId ?? PUBLIC_TENANT_ID;
+      const { limit, offset } = parsed.data;
 
-      const payload = taskPayloadSchema.safeParse(entry.data.data);
-      if (!payload.success) {
+      try {
+        const [total, jobs] = await Promise.all([
+          deadLetterQueue.getWaitingCount(),
+          deadLetterQueue.getWaiting(offset, offset + limit - 1),
+        ]);
+        await recordAudit(request, response, {
+          action: 'dead_letter.list',
+          outcome: 'success',
+          statusCode: 200,
+        });
+        response.json({
+          total,
+          limit,
+          offset,
+          items: jobs.map((job) => ({
+            taskId: job.data.originalJobId,
+            taskType: job.data.taskType,
+            failedReason: job.data.failedReason,
+            attemptsMade: job.data.attemptsMade,
+            failedAt: job.data.failedAt,
+            requestId: job.data.data.meta?.requestId ?? null,
+            tenantId: job.data.data.meta?.tenantId ?? PUBLIC_TENANT_ID,
+          })),
+        });
+      } catch (error: unknown) {
+        await recordAudit(request, response, {
+          action: 'dead_letter.list',
+          outcome: 'error',
+          statusCode: 500,
+          reason: 'list_failed',
+        });
+        next(error);
+      }
+    }),
+  );
+
+  router.post(
+    '/:taskId/replay',
+    asyncHandler(async (request, response, next) => {
+      const action = 'dead_letter.replay';
+      const parsedId = taskIdSchema.safeParse(request.params.taskId);
+      if (!parsedId.success) {
+        await recordAudit(request, response, { action, outcome: 'invalid', statusCode: 400 });
+        response.status(400).json({ error: 'Invalid task id' });
+        return;
+      }
+      const taskId = parsedId.data;
+      const operationId = randomUUID();
+      let newTaskId: string | undefined;
+      let removed = false;
+      let tenantId: string | undefined;
+
+      try {
+        const entry = await deadLetterQueue.getJob(deadLetterJobId(taskId));
+        if (!entry) {
+          await recordAudit(request, response, {
+            action,
+            outcome: 'not_found',
+            statusCode: 404,
+            taskId,
+          });
+          response.status(404).json({ error: 'Dead-letter entry not found' });
+          return;
+        }
+        tenantId = entry.data.data.meta?.tenantId ?? PUBLIC_TENANT_ID;
+
+        const payload = taskPayloadSchema.safeParse(entry.data.data);
+        if (!payload.success) {
+          await recordAudit(request, response, {
+            action,
+            outcome: 'invalid',
+            statusCode: 422,
+            taskId,
+            tenantId,
+            reason: 'payload no longer matches the task schema',
+          });
+          response
+            .status(422)
+            .json({ error: 'Dead-letter payload no longer matches the task schema' });
+          return;
+        }
+
+        await recordAudit(
+          request,
+          response,
+          { action, outcome: 'pending', taskId, tenantId, operationId },
+          { requirePersistence: true },
+        );
+        const { response: accepted } = await dispatchTask(payload.data, {
+          requestId: getRequestId(response.locals),
+          tenantId,
+          replayOf: taskId,
+          jobId: replayJobId(tenantId, taskId),
+          effectId: entry.data.data.meta?.effectId ?? entry.data.data.meta?.replayOf ?? taskId,
+          limits: response.locals.admissionLimits as AdmissionLimits | undefined,
+        });
+        newTaskId = accepted.taskId;
+        await entry.remove();
+        removed = true;
         await recordAudit(request, response, {
           action,
-          outcome: 'invalid',
-          statusCode: 422,
+          outcome: 'success',
+          statusCode: 202,
           taskId,
           tenantId,
-          reason: 'payload no longer matches the task schema',
+          operationId,
+          newTaskId: accepted.taskId,
         });
-        response
-          .status(422)
-          .json({ error: 'Dead-letter payload no longer matches the task schema' });
-        return;
-      }
-
-      // A fresh job id: the original id may still sit in the failed set within retention.
-      // The replay stays with the original tenant so its owner can still read the status.
-      const { response: accepted } = await dispatchTask(payload.data, {
-        requestId: getRequestId(response.locals),
-        tenantId,
-        replayOf: taskId,
-        effectId: entry.data.data.meta?.effectId ?? entry.data.data.meta?.replayOf ?? taskId,
-        limits: response.locals.admissionLimits as AdmissionLimits | undefined,
-      });
-      await entry.remove();
-      await recordAudit(request, response, {
-        action,
-        outcome: 'success',
-        statusCode: 202,
-        taskId,
-        tenantId,
-        newTaskId: accepted.taskId,
-      });
-      response.status(202).json({ ...accepted, replayOf: taskId });
-    } catch (error: unknown) {
-      await recordAudit(request, response, {
-        action,
-        outcome: 'error',
-        statusCode: error instanceof BackpressureError ? 429 : 500,
-        taskId,
-        reason: error instanceof Error ? error.message : 'unknown error',
-      });
-      next(error);
-    }
-  });
-
-  router.delete('/:taskId', async (request, response, next) => {
-    const action = 'dead_letter.delete';
-    const parsedId = taskIdSchema.safeParse(request.params.taskId);
-    if (!parsedId.success) {
-      await recordAudit(request, response, { action, outcome: 'invalid', statusCode: 400 });
-      response.status(400).json({ error: 'Invalid task id' });
-      return;
-    }
-    const taskId = parsedId.data;
-
-    try {
-      const entry = await deadLetterQueue.getJob(deadLetterJobId(taskId));
-      if (!entry) {
+        response.status(202).json({ ...accepted, replayOf: taskId });
+      } catch (error: unknown) {
         await recordAudit(request, response, {
           action,
-          outcome: 'not_found',
-          statusCode: 404,
+          outcome: 'error',
+          statusCode: error instanceof BackpressureError ? 429 : 500,
           taskId,
+          operationId,
+          ...(tenantId ? { tenantId } : {}),
+          ...(newTaskId ? { newTaskId } : {}),
+          reason: removed
+            ? 'audit_failed_after_replay'
+            : newTaskId
+              ? 'replay_enqueued_before_removal_failed'
+              : 'replay_failed',
         });
-        response.status(404).json({ error: 'Dead-letter entry not found' });
+        next(error);
+      }
+    }),
+  );
+
+  router.delete(
+    '/:taskId',
+    asyncHandler(async (request, response, next) => {
+      const action = 'dead_letter.delete';
+      const parsedId = taskIdSchema.safeParse(request.params.taskId);
+      if (!parsedId.success) {
+        await recordAudit(request, response, { action, outcome: 'invalid', statusCode: 400 });
+        response.status(400).json({ error: 'Invalid task id' });
         return;
       }
-      await entry.remove();
-      await recordAudit(request, response, {
-        action,
-        outcome: 'success',
-        statusCode: 204,
-        taskId,
-        tenantId: entry.data.data.meta?.tenantId ?? PUBLIC_TENANT_ID,
-      });
-      response.status(204).end();
-    } catch (error: unknown) {
-      await recordAudit(request, response, {
-        action,
-        outcome: 'error',
-        statusCode: 500,
-        taskId,
-        reason: error instanceof Error ? error.message : 'unknown error',
-      });
-      next(error);
-    }
-  });
+      const taskId = parsedId.data;
+      const operationId = randomUUID();
+      let removed = false;
+      let tenantId: string | undefined;
+
+      try {
+        const entry = await deadLetterQueue.getJob(deadLetterJobId(taskId));
+        if (!entry) {
+          await recordAudit(request, response, {
+            action,
+            outcome: 'not_found',
+            statusCode: 404,
+            taskId,
+          });
+          response.status(404).json({ error: 'Dead-letter entry not found' });
+          return;
+        }
+        tenantId = entry.data.data.meta?.tenantId ?? PUBLIC_TENANT_ID;
+        await recordAudit(
+          request,
+          response,
+          { action, outcome: 'pending', taskId, tenantId, operationId },
+          { requirePersistence: true },
+        );
+        await entry.remove();
+        removed = true;
+        await recordAudit(request, response, {
+          action,
+          outcome: 'success',
+          statusCode: 204,
+          taskId,
+          tenantId,
+          operationId,
+        });
+        response.status(204).end();
+      } catch (error: unknown) {
+        await recordAudit(request, response, {
+          action,
+          outcome: 'error',
+          statusCode: 500,
+          taskId,
+          operationId,
+          ...(tenantId ? { tenantId } : {}),
+          reason: removed ? 'audit_failed_after_delete' : 'delete_failed',
+        });
+        next(error);
+      }
+    }),
+  );
 
   return router;
 };

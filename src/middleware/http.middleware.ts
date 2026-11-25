@@ -1,10 +1,18 @@
 import { randomUUID, timingSafeEqual, createHash } from 'node:crypto';
-import type { RequestHandler } from 'express';
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import type { ApiKeyEntry } from '../config/env.js';
 import { httpRequestDuration } from '../observability/metrics.js';
 import { PUBLIC_TENANT_ID } from '../types/task.types.js';
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/u;
+
+export const asyncHandler =
+  (
+    handler: (request: Request, response: Response, next: NextFunction) => Promise<void>,
+  ): RequestHandler =>
+  (request, response, next) => {
+    Promise.resolve(handler(request, response, next)).catch(next);
+  };
 
 /** Accepts a well-formed inbound X-Request-Id or generates one, and echoes it back. */
 export const requestId: RequestHandler = (request, response, next) => {

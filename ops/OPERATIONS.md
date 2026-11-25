@@ -88,6 +88,46 @@ size, bandwidth and the timestamp of the last remotely verified version. Restore
 the latest known-good version in isolation; escalate before the RPO expires.
 Freshness alone is not proof that a production restore or off-host storage works.
 
+## Security and audit checklist
+
+- Assign security-oncall and a SIEM destination; protect logs, Redis and WORM with
+  separate access controls, retention and monitoring. Do not put credentials in URLs.
+  Configure HTTPS, least-privilege OIDC roles, CORS/proxy trust and network isolation;
+  protect the admin, metrics, Redis, Vault and archive surfaces.
+- DLQ replay/delete, secrets reload and Bull Board writes emit an audit `pending`
+  intent before mutation and a result with the same `operationId`. With Redis audit
+  enabled, failed intent persistence blocks the mutation. With
+  `AUDIT_LOG_MAX_ENTRIES=0` or no Redis audit configured, intent is **logs only**.
+  Other Redis audit failures are logged and fall back to logs. A `403` denial is
+  logged before returning; authentication failures and Bull Board terminal results
+  are logged after response finish and can be lost on process failure.
+- Investigate each unresolved `pending` using `operationId`, request ID, Redis job
+  state, DLQ and the relevant process/secret state; never infer success from intent.
+  Replay errors may include `newTaskId` with reason
+  `replay_enqueued_before_removal_failed`: the job exists even though HTTP returned
+  `500`. Replaying the same entry reuses its deterministic job ID only while that job
+  is retained. Verify external effects and the job before manually retrying.
+- Redis audit, BullMQ changes, in-memory key reload and WORM outbox enqueue are not
+  one transaction. A crash, asynchronous replication loss, stream trimming or a
+  failed enqueue can leave gaps; a queued WORM event is **not** proof of archival.
+  Compare the Redis stream and structured logs with `audit_delivery_total`, outbox
+  backlog/age and actual immutable objects; reconcile gaps and unresolved intents.
+  Direct WORM export has no retry; outbox retries only after successful enqueue.
+- Automated security/audit checks (the integration suite **flushes** its Redis DB):
+
+  ```powershell
+  npx vitest run tests\operations.test.ts tests\observability.test.ts tests\oidc.test.ts
+  $env:TEST_REDIS_URL = 'redis://127.0.0.1:6380' # disposable empty Redis only
+  npm run test:integration -- tests\integration\dead-letter.int.test.ts tests\integration\oidc.int.test.ts tests\integration\secrets.int.test.ts tests\integration\audit-worm.int.test.ts
+  ```
+
+- These checks are not a security certification. Before production commission an
+  independent pentest and external audit of code, infrastructure, auth/RBAC, TLS,
+  secrets lifecycle, log redaction, archive retention, incident response and restore.
+  Agree scope, threat model, evidence, remediation and retest, and repeat periodically.
+  Strong regulated audit completeness requires an independently durable transactional
+  journal or outbox integrated with each mutation, retention controls and reconciliation.
+
 ## External monitoring probe
 
 Run the probe from a separate monitoring machine/network, against the externally
@@ -180,9 +220,35 @@ use independent backups. Do not rely on this fixture as a production deployment.
   with the tenant limit enabled, and every metrics scrape, scans the inflight queue atomically
   in Redis; benchmark representative backlog and payload sizes before enabling.
   FIFO and bounded inflight prevent an endlessly growing single-tenant backlog,
-  but do not reserve worker slots or provide strict round-robin scheduling.
-  Bull Board/manual Redis writes and old API replicas can bypass admission limits.
+  but do not by themselves provide strict round-robin scheduling.
+  The scan reflects Bull Board retry, tenant-data edits, individual removal and
+  queue emptying on the next admission; however Bull Board/manual Redis writes and
+  old API replicas can bypass admission limits. An O(1) index and crash-safe
+  coordination with those mutations remain unimplemented.
   Tenant IDs appear as metric labels: restrict metrics access and budget cardinality.
+- `TENANT_MAX_ACTIVE_SLOTS=0` disables execution isolation; otherwise configure the
+  same positive value and `JOB_TIMEOUT_MS` on every worker, including the `all` role.
+  A Redis lease is keyed by tenant and job/lock token; saturation delays jobs for
+  100-199 ms without consuming a failed attempt. Monitor `tenant_active_slots` and
+  `tenant_fair_share_deferrals_total`. Bull Board changes do not own these leases;
+  workers release them in `finally`, and abandoned leases expire after
+  `JOB_TIMEOUT_MS + 30000` ms. A Redis error fails the attempt rather than silently
+  bypassing the limit. Sentinel replication loss, a long event-loop pause, or an
+  external operation ignoring cancellation can outlive a lease; this is not physical
+  fencing or a guarantee of exactly-once external effects. It is not strict
+  round-robin: a large FIFO backlog must be deferred before later jobs are reached,
+  so latency depends on backlog and Redis/worker capacity.
+- The reproducible isolated integration test below checks a 1000-job backlog, two
+  tenants, 50 normal requests spaced by at least 100ms with a 10-second per-task bound,
+  deferral without consuming
+  attempts, abandoned lease expiry and no remaining active slots. It does **not**
+  validate scalable inflight counters: admission still uses the scan above.
+
+  ```powershell
+  $env:TEST_REDIS_URL = 'redis://127.0.0.1:6380' # disposable empty Redis only
+  npm run test:integration -- tests\integration\tenant-slots.int.test.ts
+  ```
+
 - For API-key rotation, add the new key under the same tenant in Vault/OpenBao or
   an atomically replaced, access-controlled `API_KEYS_FILE`, refresh every API replica
   via `POST /admin/api/secrets/reload` or wait for its configured

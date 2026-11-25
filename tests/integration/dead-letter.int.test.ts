@@ -1,7 +1,7 @@
 import type { Worker } from 'bullmq';
 import request from 'supertest';
 import type { Express } from 'express';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { redis } from '../../src/config/redis.js';
 import type { AuditRecord } from '../../src/observability/audit.js';
 import {
@@ -279,6 +279,47 @@ describe('dead-letter queue and admin audit against a real Redis', () => {
       taskId,
       statusCode: 204,
     });
+  });
+
+  it('does not enqueue a second replay after removal fails following enqueue', async () => {
+    const taskId = await deadLetteredInvoice();
+    const entry = await deadLetterQueue.getJob(deadLetterJobId(taskId));
+    if (!entry) throw new Error('Expected dead-letter entry');
+    vi.spyOn(entry, 'remove').mockRejectedValueOnce(new Error('private Redis detail'));
+    const lookup = vi.spyOn(deadLetterQueue, 'getJob').mockResolvedValueOnce(entry);
+    billingUp = true;
+
+    try {
+      const failed = await admin('post', `/admin/api/dead-letter/${taskId}/replay`);
+      expect(failed.status).toBe(500);
+      expect(failed.text).not.toContain('private Redis detail');
+      const afterFailure = await auditRecords();
+      const failure = afterFailure.find(
+        (record) => record.action === 'dead_letter.replay' && record.outcome === 'error',
+      );
+      expect(failure).toMatchObject({
+        taskId,
+        newTaskId: expect.any(String),
+        reason: 'replay_enqueued_before_removal_failed',
+        statusCode: 500,
+      });
+      expect(afterFailure).toContainEqual(
+        expect.objectContaining({
+          action: 'dead_letter.replay',
+          outcome: 'pending',
+          operationId: failure?.operationId,
+        }),
+      );
+      expect(await deadLetterQueue.getJob(deadLetterJobId(taskId))).toBeDefined();
+      const retried = await admin('post', `/admin/api/dead-letter/${taskId}/replay`);
+      expect(retried.status).toBe(202);
+      expect(retried.body.taskId).toBe(failure?.newTaskId);
+      expect(await deadLetterQueue.getJob(deadLetterJobId(taskId))).toBeUndefined();
+      const jobs = await taskQueue.getJobs(['waiting', 'active', 'completed', 'failed', 'delayed']);
+      expect(jobs.filter((job) => job.data.meta?.replayOf === taskId)).toHaveLength(1);
+    } finally {
+      lookup.mockRestore();
+    }
   });
 
   it('audits rejected admin access without persisting credentials', async () => {

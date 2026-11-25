@@ -19,6 +19,7 @@ export default defineConfig({
       SECRETS_PROVIDER: 'env',
       REDIS_SENTINEL_HOSTS: '',
       REDIS_SENTINEL_MASTER_NAME: '',
+      TENANT_MAX_ACTIVE_SLOTS: '0',
     },
     coverage: {
       provider: 'v8',

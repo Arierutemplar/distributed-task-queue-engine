@@ -218,7 +218,7 @@ describe('admin surface', () => {
         ...invoice,
         meta: expect.objectContaining({ replayOf: '9', tenantId: 'key-original-tenant' }),
       },
-      undefined,
+      { jobId: expect.stringMatching(/^replay-[a-f0-9]{64}$/u) },
     );
     expect(mocks.deadLetterGetJob).toHaveBeenCalledWith('dlq-9');
     expect(remove).toHaveBeenCalledOnce();
@@ -263,6 +263,13 @@ describe('admin surface', () => {
     expect(events).toEqual([
       expect.objectContaining({
         action: 'dead_letter.delete',
+        outcome: 'pending',
+        actor: 'admin',
+        taskId: '5',
+        tenantId: 'acme',
+      }),
+      expect.objectContaining({
+        action: 'dead_letter.delete',
         outcome: 'success',
         actor: 'admin',
         taskId: '5',
@@ -275,6 +282,70 @@ describe('admin surface', () => {
         taskId: '6',
       }),
     ]);
+    expect(events[0]?.operationId).toBe(events[1]?.operationId);
+  });
+
+  it('does not mutate the DLQ if the required audit intent cannot be persisted', async () => {
+    const app = await buildApp();
+    const remove = vi.fn();
+    mocks.deadLetterGetJob.mockResolvedValueOnce({
+      data: { originalJobId: '5', data: { ...invoice, meta: { tenantId: 'acme' } } },
+      remove,
+    });
+    auditLog.record.mockRejectedValueOnce(new Error('private-audit-secret'));
+
+    const response = await request(app)
+      .delete('/admin/api/dead-letter/5')
+      .set('Authorization', basic('admin', ADMIN_PASSWORD));
+    expect(response.status).toBe(500);
+    expect(response.text).not.toContain('private-audit-secret');
+    expect(response.text).not.toContain('Error:');
+    expect(remove).not.toHaveBeenCalled();
+    expect(auditLog.record).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: 'dead_letter.delete', outcome: 'error' }),
+    );
+    expect(auditActions()).toEqual(['dead_letter.delete', 'dead_letter.delete']);
+    expect(JSON.stringify(auditLog.record.mock.calls)).not.toContain('private-audit-secret');
+  });
+
+  it('records partial replay failure and reuses the same job identity on retry', async () => {
+    const app = await buildApp();
+    const remove = vi.fn().mockRejectedValueOnce(new Error('private-redis-secret'));
+    mocks.deadLetterGetJob.mockResolvedValue({
+      data: { originalJobId: '9', data: { ...invoice, meta: { tenantId: 'acme' } } },
+      remove,
+    });
+    const replay = () =>
+      request(app)
+        .post('/admin/api/dead-letter/9/replay')
+        .set('Authorization', basic('admin', ADMIN_PASSWORD));
+    const failed = await replay();
+    expect(failed.status).toBe(500);
+    expect(failed.text).not.toContain('private-redis-secret');
+    expect(auditLog.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'dead_letter.replay',
+        outcome: 'error',
+        newTaskId: 'replayed-1',
+        reason: 'replay_enqueued_before_removal_failed',
+      }),
+    );
+    expect((await replay()).status).toBe(202);
+    const firstOptions = mocks.add.mock.calls[0]?.[2];
+    expect(firstOptions).toEqual({ jobId: expect.stringMatching(/^replay-[a-f0-9]{64}$/u) });
+    expect(mocks.add.mock.calls[1]?.[2]).toEqual(firstOptions);
+    expect(JSON.stringify(auditLog.record.mock.calls)).not.toContain('private-redis-secret');
+  });
+
+  it('forwards asynchronous audit failures to the safe error handler', async () => {
+    const app = await buildApp();
+    auditLog.record.mockRejectedValueOnce(new Error('private-audit-secret'));
+    const response = await request(app)
+      .delete('/admin/api/dead-letter/bad:id')
+      .set('Authorization', basic('admin', ADMIN_PASSWORD));
+    expect(response.status).toBe(500);
+    expect(response.body.error).toBe('Internal server error');
+    expect(response.text).not.toContain('private-audit-secret');
   });
 
   it('validates pagination and ids and audits invalid or missing replay entries', async () => {

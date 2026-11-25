@@ -176,12 +176,28 @@ describe('preload before runtime configuration for API and worker entry points',
         await fetch(`${base}/admin/api/audit`, {
           headers: { Authorization: authorization },
         })
-      ).json()) as { items: { action: string; outcome: string }[] };
+      ).json()) as { items: { action: string; outcome: string; operationId?: string }[] };
       expect(audit.items).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ action: 'admin.secrets_reload', outcome: 'success' }),
+          expect.objectContaining({ action: 'admin.secrets_reload', outcome: 'error' }),
         ]),
       );
+      for (const result of audit.items.filter(
+        (item) => item.action === 'admin.secrets_reload' && item.outcome !== 'pending',
+      )) {
+        expect(audit.items).toContainEqual(
+          expect.objectContaining({
+            action: 'admin.secrets_reload',
+            outcome: 'pending',
+            operationId: result.operationId,
+          }),
+        );
+      }
+      const serialized = JSON.stringify(audit);
+      for (const secret of [apiKey, nextKey, password, vaultToken, 'invalid-short-key']) {
+        expect(serialized).not.toContain(secret);
+      }
     } finally {
       process.child.kill();
       await process.exited;

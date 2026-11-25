@@ -322,5 +322,11 @@ describe('audit log', () => {
     await expect(audit.record(event)).resolves.toBeUndefined();
     expect(sink.write).toHaveBeenCalledTimes(2);
     expect(sink.write).toHaveBeenLastCalledWith(expect.objectContaining(event));
+
+    redis.xadd.mockRejectedValueOnce(new Error('secret Redis failure'));
+    await expect(audit.record(event, { requirePersistence: true })).rejects.toThrow(
+      'Required audit persistence failed',
+    );
+    expect(sink.write).toHaveBeenCalledTimes(2);
   });
 });

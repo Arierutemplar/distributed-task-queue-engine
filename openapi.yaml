@@ -15,7 +15,12 @@ info:
     SameSite=Lax; cookie-authenticated writes require a matching Origin.
     Realm roles or resource_access.<OIDC_CLIENT_ID>.roles grant admin full access
     or viewer read-only access. Writes denied with 403 are audited with subject/role.
-    Administrative audit stays in Redis and structured logs. AUDIT_WORM_ENABLED
+    Administrative mutations first emit a pending audit intent with operationId,
+    followed by a correlated result. A configured Redis audit failure blocks the
+    mutation if intent persistence fails; logs-only mode has no persistent intent.
+    A crash can leave pending unresolved. Redis, mutation and WORM delivery are not
+    atomic; Redis replication/trimming and failed archival can create gaps.
+    Administrative audit uses Redis and structured logs. AUDIT_WORM_ENABLED
     defaults to false; enabling it with complete AUDIT_WORM_ACCESS_KEY_ID and
     AUDIT_WORM_SECRET_ACCESS_KEY adds best-effort S3 Object Lock export, one JSON
     object per event. AUDIT_WORM_ENDPOINT is optional for AWS regional S3 or points
@@ -563,7 +568,7 @@ components:
         id: { type: string }
         timestamp: { type: string, format: date-time }
         action: { type: string }
-        outcome: { type: string, enum: [success, denied, not_found, invalid, error] }
+        outcome: { type: string, enum: [pending, success, denied, not_found, invalid, error] }
         actor: { type: string, nullable: true }
         requestId: { type: string }
         method: { type: string }
@@ -573,4 +578,5 @@ components:
         tenantId: { type: string }
         taskId: { type: string }
         newTaskId: { type: string }
+        operationId: { type: string, format: uuid }
         reason: { type: string }

@@ -4,6 +4,7 @@ import { deadLetterQueue, readDeadLetterCounts } from '../queues/dead-letter.que
 import { taskQueue } from '../queues/task.queue.js';
 import type { CircuitState } from '../resilience/circuit-breaker.js';
 import { readTenantInflight } from '../queues/admission.js';
+import { readTenantActiveSlots } from '../queues/tenant-slots.js';
 
 export const metricsRegistry = new Registry();
 metricsRegistry.setDefaultLabels({ service: config.SERVICE_NAME, role: config.PROCESS_ROLE });
@@ -29,6 +30,25 @@ export const backpressureRejections = new Counter({
   help: 'Admission rejections by capacity limit',
   labelNames: ['reason'] as const,
   registers: [metricsRegistry],
+});
+
+export const fairShareDeferrals = new Counter({
+  name: 'tenant_fair_share_deferrals_total',
+  help: 'Task attempts deferred because their tenant has no free active slot',
+  labelNames: ['tenant'] as const,
+  registers: [metricsRegistry],
+});
+
+new Gauge({
+  name: 'tenant_active_slots',
+  help: 'Current unexpired worker slot leases per tenant',
+  labelNames: ['tenant'] as const,
+  registers: [metricsRegistry],
+  async collect() {
+    const counts = await readTenantActiveSlots();
+    this.reset();
+    for (const [tenant, count] of counts) this.set({ tenant }, count);
+  },
 });
 
 new Gauge({

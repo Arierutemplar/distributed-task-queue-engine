@@ -34,6 +34,7 @@ export default defineConfig({
       SECRETS_PROVIDER: 'env',
       REDIS_SENTINEL_HOSTS: '',
       REDIS_SENTINEL_MASTER_NAME: '',
+      TENANT_MAX_ACTIVE_SLOTS: '0',
       // Short, deterministic retry schedule: 3 attempts, 100ms then 200ms backoff.
       TASK_MAX_ATTEMPTS: '3',
       TASK_BACKOFF_DELAY_MS: '100',

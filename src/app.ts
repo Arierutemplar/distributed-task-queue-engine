@@ -7,6 +7,7 @@ import express, {
 } from 'express';
 import { rateLimit, type Store } from 'express-rate-limit';
 import helmet from 'helmet';
+import { randomUUID } from 'node:crypto';
 import type { LevelWithSilent } from 'pino';
 import { pinoHttp } from 'pino-http';
 import { z } from 'zod';
@@ -14,6 +15,7 @@ import { config, runsApi, type AppConfig } from './config/env.js';
 import { logger } from './config/logger.js';
 import {
   apiKeyAuth,
+  asyncHandler,
   getAdminActor,
   getAdminIdentity,
   getRequestId,
@@ -55,11 +57,15 @@ const isBodyParserError = (error: unknown): error is { type: string; status: num
 const auditLimitSchema = z.coerce.number().int().min(1).max(1_000).default(100);
 
 // Responses on the admin surface that are security relevant even without a handler-level record.
-const adminAccessAction = (request: Request, statusCode: number): AuditAction | undefined => {
+const adminAccessAction = (
+  request: Request,
+  statusCode: number,
+  actor: string | null,
+): AuditAction | undefined => {
   if (statusCode === 401) return 'admin.auth_failed';
-  if (statusCode === 403) return 'admin.access_denied';
   if (statusCode === 429) return 'admin.auth_locked';
-  if (statusCode === 503) return 'admin.disabled';
+  if (statusCode === 403) return undefined;
+  if (statusCode === 503 && !actor) return 'admin.disabled';
   // Bull Board mutations (retry, clean, promote, remove...) are operator actions too.
   if (request.originalUrl.startsWith('/admin/queues/api/') && request.method !== 'GET') {
     return 'admin.bull_board_action';
@@ -83,10 +89,7 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
       serializers: {
         req: (request: { url?: string }) => ({
           ...request,
-          url:
-            request.url && /^\/admin\/callback(?:\/|\?|$)/iu.test(request.url)
-              ? '/admin/callback'
-              : request.url,
+          url: request.url?.split('?')[0],
         }),
       },
       genReqId: (_request, response) => getRequestId(response.locals),
@@ -199,57 +202,97 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
       },
     });
 
-    const security = createAdminSecurity(settings);
+    const auditForbidden = (request: Request, response: Response): Promise<void> =>
+      audit.record({
+        action: 'admin.access_denied',
+        outcome: 'denied',
+        actor: getAdminActor(response.locals),
+        ...getAdminIdentity(response.locals),
+        requestId: getRequestId(response.locals),
+        method: request.method,
+        path: request.originalUrl.split('?')[0] ?? request.originalUrl,
+        ip: request.ip,
+        statusCode: 403,
+      });
+    const security = createAdminSecurity(settings, auditForbidden);
     app.use('/admin', (request, response, next) => {
       response.once('finish', () => {
-        const action = adminAccessAction(request, response.statusCode);
+        const action = adminAccessAction(
+          request,
+          response.statusCode,
+          getAdminActor(response.locals),
+        );
         if (!action) {
           return;
         }
-        void audit.record({
-          action,
-          outcome: response.statusCode < 400 ? 'success' : 'denied',
-          actor: getAdminActor(response.locals),
-          ...getAdminIdentity(response.locals),
-          requestId: getRequestId(response.locals),
-          method: request.method,
-          path: request.originalUrl.split('?')[0] ?? request.originalUrl,
-          ip: request.ip,
-          statusCode: response.statusCode,
-        });
+        void audit
+          .record({
+            action,
+            outcome:
+              response.statusCode < 400
+                ? 'success'
+                : response.statusCode === 404
+                  ? 'not_found'
+                  : response.statusCode === 403 || response.statusCode === 401
+                    ? 'denied'
+                    : 'error',
+            actor: getAdminActor(response.locals),
+            ...getAdminIdentity(response.locals),
+            requestId: getRequestId(response.locals),
+            method: request.method,
+            path: request.originalUrl.split('?')[0] ?? request.originalUrl,
+            ip: request.ip,
+            statusCode: response.statusCode,
+            ...(typeof response.locals.auditOperationId === 'string'
+              ? { operationId: response.locals.auditOperationId }
+              : {}),
+          })
+          .catch(() => {
+            logger.error(
+              { action, requestId: getRequestId(response.locals) },
+              'Admin audit failed',
+            );
+          });
       });
       next();
     });
     app.use('/admin', adminAuthLimiter);
     app.use('/admin', security.router, security.authenticate);
-    app.post('/admin/api/secrets/reload', async (request, response, next) => {
-      if (response.locals.adminRole !== 'admin') {
-        response.status(403).json({ error: 'Forbidden' });
-        return;
-      }
-      const event = {
-        action: 'admin.secrets_reload' as const,
-        actor: getAdminActor(response.locals),
-        ...getAdminIdentity(response.locals),
-        requestId: getRequestId(response.locals),
-        method: request.method,
-        path: '/admin/api/secrets/reload',
-        ip: request.ip,
-      };
-      if (!options.secretsReloader) {
-        await audit.record({ ...event, outcome: 'error', statusCode: 503 });
-        response.status(503).json({ error: 'Secrets reload is unavailable' });
-        return;
-      }
-      try {
-        await options.secretsReloader.reload();
+    app.post(
+      '/admin/api/secrets/reload',
+      asyncHandler(async (request, response, next) => {
+        if (response.locals.adminRole !== 'admin') {
+          await auditForbidden(request, response);
+          response.status(403).json({ error: 'Forbidden' });
+          return;
+        }
+        const event = {
+          action: 'admin.secrets_reload' as const,
+          actor: getAdminActor(response.locals),
+          ...getAdminIdentity(response.locals),
+          requestId: getRequestId(response.locals),
+          method: request.method,
+          path: '/admin/api/secrets/reload',
+          ip: request.ip,
+          operationId: randomUUID(),
+        };
+        if (!options.secretsReloader) {
+          await audit.record({ ...event, outcome: 'error', statusCode: 503 });
+          response.status(503).json({ error: 'Secrets reload is unavailable' });
+          return;
+        }
+        try {
+          await audit.record({ ...event, outcome: 'pending' }, { requirePersistence: true });
+          await options.secretsReloader.reload();
+        } catch (error: unknown) {
+          await audit.record({ ...event, outcome: 'error', statusCode: 500 });
+          next(error);
+          return;
+        }
         await audit.record({ ...event, outcome: 'success', statusCode: 200 });
         response.json({ status: 'reloaded' });
-      } catch (error: unknown) {
-        await audit.record({ ...event, outcome: 'error', statusCode: 500 });
-        next(error);
-      }
-    });
+      }),
+    );
     app.get('/admin/api/audit', async (request, response, next) => {
       const limit = auditLimitSchema.safeParse(request.query.limit);
       if (!limit.success) {
@@ -279,7 +322,41 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
       express.json({ limit: '16kb' }),
       createDeadLetterRouter(audit),
     );
-    app.use('/admin/queues', boardRouter);
+    app.use(
+      '/admin/queues',
+      async (request, response, next) => {
+        if (
+          request.method === 'GET' ||
+          request.method === 'HEAD' ||
+          !request.path.startsWith('/api/')
+        ) {
+          next();
+          return;
+        }
+        const operationId = randomUUID();
+        try {
+          await audit.record(
+            {
+              action: 'admin.bull_board_action',
+              outcome: 'pending',
+              actor: getAdminActor(response.locals),
+              ...getAdminIdentity(response.locals),
+              requestId: getRequestId(response.locals),
+              method: request.method,
+              path: request.originalUrl.split('?')[0] ?? request.originalUrl,
+              ip: request.ip,
+              operationId,
+            },
+            { requirePersistence: true },
+          );
+          response.locals.auditOperationId = operationId;
+          next();
+        } catch (error: unknown) {
+          next(error);
+        }
+      },
+      boardRouter,
+    );
   }
 
   app.use((_request, response) => {
@@ -329,7 +406,7 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
       return;
     }
 
-    logger.error({ err: error, requestId: requestIdValue }, 'Unhandled request error');
+    logger.error({ requestId: requestIdValue }, 'Unhandled request error');
     response.status(500).json({ error: 'Internal server error', requestId: requestIdValue });
   };
 

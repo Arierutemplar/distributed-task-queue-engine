@@ -14,7 +14,14 @@ export const AUDIT_ACTIONS = [
   'dead_letter.replay',
   'dead_letter.delete',
 ] as const;
-export const AUDIT_OUTCOMES = ['success', 'denied', 'not_found', 'invalid', 'error'] as const;
+export const AUDIT_OUTCOMES = [
+  'pending',
+  'success',
+  'denied',
+  'not_found',
+  'invalid',
+  'error',
+] as const;
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
 export type AuditOutcome = (typeof AUDIT_OUTCOMES)[number];
 
@@ -34,6 +41,7 @@ export interface AuditEvent {
   tenantId?: string;
   taskId?: string;
   newTaskId?: string;
+  operationId?: string;
   reason?: string;
 }
 
@@ -44,7 +52,7 @@ export interface AuditRecord extends AuditEvent {
 }
 
 export interface AuditLog {
-  record: (event: AuditEvent) => Promise<void>;
+  record: (event: AuditEvent, options?: { requirePersistence?: boolean }) => Promise<void>;
   list: (limit: number) => Promise<AuditRecord[]>;
 }
 
@@ -70,7 +78,8 @@ export interface AuditLogOptions {
 /**
  * Structured audit trail for privileged actions. Every record is emitted as a log line
  * (`audit: true`) for the log pipeline/SIEM and, optionally, persisted in a Redis stream
- * capped at `maxEntries`. Persistence failures are logged but never fail the request.
+ * capped at `maxEntries`. A required intent fails closed if configured Redis persistence fails;
+ * otherwise persistence failures are logged and the record remains in structured logs.
  */
 export const createAuditLog = (options: AuditLogOptions): AuditLog => {
   const log = options.logger.child({ audit: true });
@@ -80,7 +89,7 @@ export const createAuditLog = (options: AuditLogOptions): AuditLog => {
   const persist = options.redis && maxEntries > 0 ? options.redis : undefined;
 
   return {
-    async record(event) {
+    async record(event, recordOptions) {
       const record: AuditRecord = {
         timestamp: now().toISOString(),
         ...event,
@@ -88,8 +97,6 @@ export const createAuditLog = (options: AuditLogOptions): AuditLog => {
       };
       const level = record.outcome === 'success' ? 'info' : 'warn';
       log[level]({ event: record }, `audit ${record.action} ${record.outcome}`);
-      // Start independently of Redis, including logs-only mode and Redis write failures.
-      const archived = options.sink?.write(record);
       if (persist) {
         try {
           await persist.xadd(
@@ -101,11 +108,19 @@ export const createAuditLog = (options: AuditLogOptions): AuditLog => {
             'record',
             JSON.stringify(record),
           );
-        } catch (error: unknown) {
-          log.error({ err: error, action: record.action }, 'Failed to persist audit record');
+        } catch {
+          log.error(
+            { action: record.action, requestId: record.requestId },
+            'Failed to persist audit record',
+          );
+          if (recordOptions?.requirePersistence) {
+            throw new Error('Required audit persistence failed');
+          }
         }
+      } else if (recordOptions?.requirePersistence) {
+        log.warn({ action: record.action }, 'Required audit intent is available in logs only');
       }
-      await archived;
+      await options.sink?.write(record);
     },
 
     async list(limit) {

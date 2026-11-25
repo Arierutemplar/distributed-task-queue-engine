@@ -1,4 +1,4 @@
-import { Worker } from 'bullmq';
+import { DelayedError, Worker } from 'bullmq';
 import { SpanKind, trace } from '@opentelemetry/api';
 import { config } from '../config/env.js';
 import { logger } from '../config/logger.js';
@@ -8,14 +8,21 @@ import {
   taskEndToEndDuration,
   tasksProcessedTotal,
   setCircuitState,
+  fairShareDeferrals,
 } from '../observability/metrics.js';
 import { jobAttemptContext, withJobSpan, withTraceContext } from '../observability/tracing.js';
 import { addDeadLetter } from '../queues/dead-letter.queue.js';
 import { TASK_QUEUE_NAME } from '../queues/task.queue.js';
+import { acquireTenantSlot, releaseTenantSlot } from '../queues/tenant-slots.js';
 import { RedisCircuitBreaker } from '../resilience/redis-circuit-breaker.js';
 import { BillingMockService, type BillingGateway } from '../services/billing.mock.service.js';
 import { RedisEffectStore } from '../services/effect-idempotency.js';
-import type { TaskJobData, TaskResult, TaskType } from '../types/task.types.js';
+import {
+  PUBLIC_TENANT_ID,
+  type TaskJobData,
+  type TaskResult,
+  type TaskType,
+} from '../types/task.types.js';
 import { createTaskProcessor, type TaskJob } from './task.processor.js';
 
 const BILLING_CIRCUIT = 'billing';
@@ -75,12 +82,15 @@ export interface TaskWorkerOptions {
   /** Billing gateway; defaults to the mock configured by BILLING_FAILURE_RATE. */
   billing?: BillingGateway;
   concurrency?: number;
+  activeSlots?: number;
+  timeoutMs?: number;
   circuitBreaker?: { failureThreshold?: number; resetTimeoutMs?: number };
 }
 
 export const createTaskWorker = (
   options: TaskWorkerOptions = {},
 ): Worker<TaskJobData, TaskResult, TaskType> => {
+  const timeoutMs = options.timeoutMs ?? config.JOB_TIMEOUT_MS;
   const billingCircuit = new RedisCircuitBreaker({
     redis: coordinationRedis,
     key: `${config.SERVICE_NAME}:circuit:billing`,
@@ -89,7 +99,7 @@ export const createTaskWorker = (
       options.circuitBreaker?.failureThreshold ?? config.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
     resetTimeoutMs:
       options.circuitBreaker?.resetTimeoutMs ?? config.CIRCUIT_BREAKER_RESET_TIMEOUT_MS,
-    probeLeaseMs: config.JOB_TIMEOUT_MS + 1_000,
+    probeLeaseMs: timeoutMs + 1_000,
     onStateChange: (state, previous) => {
       setCircuitState(BILLING_CIRCUIT, state);
       if (state !== previous) {
@@ -110,11 +120,36 @@ export const createTaskWorker = (
     billingCircuit,
     effects,
     effectNamespace: config.SERVICE_NAME,
-    timeoutMs: config.JOB_TIMEOUT_MS,
+    timeoutMs,
     logger,
   });
 
-  const worker = new Worker<TaskJobData, TaskResult, TaskType>(TASK_QUEUE_NAME, processor, {
+  const activeSlots = options.activeSlots ?? config.TENANT_MAX_ACTIVE_SLOTS;
+  const workerProcessor =
+    activeSlots === 0
+      ? processor
+      : async (job: TaskJob, token?: string) => {
+          if (!job.id || !token) throw new Error('Missing job identity or lock token');
+          const tenantId = job.data.meta?.tenantId ?? PUBLIC_TENANT_ID;
+          const acquired = await acquireTenantSlot(
+            tenantId,
+            job.id,
+            token,
+            activeSlots,
+            timeoutMs + 30_000,
+          );
+          if (!acquired) {
+            await job.moveToDelayed(Date.now() + 100 + Math.floor(Math.random() * 100), token);
+            fairShareDeferrals.inc({ tenant: tenantId });
+            throw new DelayedError();
+          }
+          try {
+            return await processor(job);
+          } finally {
+            await releaseTenantSlot(tenantId, job.id, token);
+          }
+        };
+  const worker = new Worker<TaskJobData, TaskResult, TaskType>(TASK_QUEUE_NAME, workerProcessor, {
     connection: redis,
     concurrency: options.concurrency ?? config.WORKER_CONCURRENCY,
   });
