@@ -26,7 +26,20 @@ info:
     Incomplete credentials disable archival with a warning. Archive failures are
     logged without credentials and do not change API responses. The audit read
     API still reads Redis, not S3; no new storage API or security scheme is added.
+    AUDIT_WORM_DELIVERY defaults to direct; opt-in outbox persists sanitized events
+    in Redis and retries Object Lock delivery, including exhausted jobs after restart.
+    Outbox requires WORM enabled and complete credentials. Recovery starts only
+    after successful enqueue; admin mutation and audit enqueue are not atomic.
+    DLQ_RECONCILE_ENABLED defaults to false; enabling it retains terminal originals
+    for bounded, generation-aware repair of missed failure callbacks.
+    PRODUCTION_HARDENING_ENABLED defaults to false; the production overlay requires
+    HTTPS OIDC/archive, explicit CORS/proxy, durable audit and DLQ reconciliation.
+    Optional off-host encrypted backups and load/failure/restore drills expose no
+    new business API. See ops/OPERATIONS.md for retention, RPO/RTO/SLO objectives,
+    measured technical restore scope and rollout/rollback.
     In non-production environments without API_KEYS, task requests use the public tenant.
+    QUEUE_MAX_WAITING and TENANT_MAX_INFLIGHT default to 0 (disabled). Admission limits
+    are coordinated in Redis. API_KEYS may be reloaded from Vault/OpenBao or API_KEYS_FILE.
     X-Request-Id is echoed on every response; invalid values are replaced.
 paths:
   /health/live:
@@ -104,7 +117,15 @@ paths:
         '401': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
         '413': { $ref: '#/components/responses/Error' }
-        '429': { $ref: '#/components/responses/Error' }
+        '429':
+          description: Rate limit or queue/tenant capacity exceeded
+          headers:
+            Retry-After:
+              description: Delay in seconds before retrying capacity rejections
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '500': { $ref: '#/components/responses/Error' }
   /api/v1/tasks/{taskId}:
     get:
@@ -228,6 +249,29 @@ paths:
         '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
         '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /admin/api/secrets/reload:
+    post:
+      summary: Reload API keys on this API process
+      description: Admin only; reloads the configured Vault/OpenBao secret or API_KEYS_FILE, records an audit event, and preserves the previous keys on failure.
+      security:
+        - BasicAuth: []
+        - OidcBearer: []
+        - AdminSession: []
+      responses:
+        '200':
+          description: Keys reloaded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [reloaded] }
+        '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
+        '403': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }
         '500': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
@@ -372,6 +416,7 @@ components:
       required: [type, documentId, content]
       properties:
         type: { type: string, enum: [PROCESS_DOCUMENT] }
+        schemaVersion: { type: integer, enum: [1], default: 1 }
         documentId: { type: string, minLength: 1, maxLength: 200, pattern: '\S' }
         content: { type: string, minLength: 1, maxLength: 1000000 }
     SendNotification:
@@ -379,6 +424,7 @@ components:
       required: [type, recipient, subject, message]
       properties:
         type: { type: string, enum: [SEND_NOTIFICATION] }
+        schemaVersion: { type: integer, enum: [1], default: 1 }
         recipient: { type: string, format: email, maxLength: 320 }
         subject: { type: string, minLength: 1, maxLength: 200, pattern: '\S' }
         message: { type: string, minLength: 1, maxLength: 10000 }
@@ -387,6 +433,7 @@ components:
       required: [type, customerId, amount, currency, taxId, items]
       properties:
         type: { type: string, enum: [PROCESS_INVOICE] }
+        schemaVersion: { type: integer, enum: [1], default: 1 }
         customerId: { type: string, minLength: 1, maxLength: 200, pattern: '\S' }
         amount: { type: number, exclusiveMinimum: true, minimum: 0 }
         currency: { type: string, minLength: 1, maxLength: 10, pattern: '\S' }

@@ -1,18 +1,22 @@
 import type { Redis } from 'ioredis';
 import type { Logger } from 'pino';
+import { randomUUID } from 'node:crypto';
 
-export type AuditAction =
-  | 'admin.auth_failed'
-  | 'admin.auth_locked'
-  | 'admin.disabled'
-  | 'admin.access_denied'
-  | 'admin.audit_read'
-  | 'admin.bull_board_action'
-  | 'dead_letter.list'
-  | 'dead_letter.replay'
-  | 'dead_letter.delete';
-
-export type AuditOutcome = 'success' | 'denied' | 'not_found' | 'invalid' | 'error';
+export const AUDIT_ACTIONS = [
+  'admin.auth_failed',
+  'admin.auth_locked',
+  'admin.disabled',
+  'admin.access_denied',
+  'admin.audit_read',
+  'admin.secrets_reload',
+  'admin.bull_board_action',
+  'dead_letter.list',
+  'dead_letter.replay',
+  'dead_letter.delete',
+] as const;
+export const AUDIT_OUTCOMES = ['success', 'denied', 'not_found', 'invalid', 'error'] as const;
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
+export type AuditOutcome = (typeof AUDIT_OUTCOMES)[number];
 
 /** What the caller describes. Never put credentials, API keys or payloads here. */
 export interface AuditEvent {
@@ -35,6 +39,7 @@ export interface AuditEvent {
 
 export interface AuditRecord extends AuditEvent {
   id?: string;
+  archiveId?: string;
   timestamp: string;
 }
 
@@ -44,6 +49,7 @@ export interface AuditLog {
 }
 
 export interface AuditSink {
+  durable?: boolean;
   /** Archives one record; failures must be logged without rejecting the main audit flow. */
   write: (record: AuditRecord) => Promise<void>;
   close: () => Promise<void>;
@@ -75,7 +81,11 @@ export const createAuditLog = (options: AuditLogOptions): AuditLog => {
 
   return {
     async record(event) {
-      const record: AuditRecord = { timestamp: now().toISOString(), ...event };
+      const record: AuditRecord = {
+        timestamp: now().toISOString(),
+        ...event,
+        ...(options.sink?.durable ? { archiveId: randomUUID() } : {}),
+      };
       const level = record.outcome === 'success' ? 'info' : 'warn';
       log[level]({ event: record }, `audit ${record.action} ${record.outcome}`);
       // Start independently of Redis, including logs-only mode and Redis write failures.

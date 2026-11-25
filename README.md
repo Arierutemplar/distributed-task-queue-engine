@@ -12,8 +12,10 @@ This repository is a working reference for that flow. The invoice handler is a m
 - **Authentication and tenants.** Every task request carries an `X-API-Key` header that must match one of `API_KEYS`. An entry written as `tenantId:key` maps the key to a stable tenant, so several keys can share one tenant and a key can be rotated without losing access to its tasks; a plain `key` entry is its own tenant, identified by `key-<first 16 hex of sha256(key)>`. The tenant is stored in `meta.tenantId`. Optionally, `RATE_LIMIT_TENANT_MAX` caps requests per tenant (all of its keys together) per window. A tenant can only read its own tasks: another tenant's id returns `404`, the same as an unknown id. With `API_KEYS` unset (allowed only outside production) every caller shares the `public` tenant.
 - **Idempotency.** An optional `Idempotency-Key` header (1–255 printable ASCII characters) becomes the BullMQ job id `idem-<sha256(tenantId + key)>`, so two tenants can use the same key independently. `Queue.add` with an existing id is atomic and does not create a second job, so concurrent duplicates converge on one job. The service then reads the stored job: same payload hash returns `202` with the original `taskId` and `acceptedAt` plus `Idempotent-Replayed: true`; a different payload returns `409`. The idempotency window equals job retention (see below). Without the header, every request creates a new job.
 - **Worker.** `createTaskWorker()` starts a BullMQ `Worker` on `tasks`. `WORKER_CONCURRENCY` sets how many jobs one process runs at once (default 10, accepted range 1–1000). All configuration is parsed once by a Zod schema in `src/config/env.ts`; an invalid value stops the process before it connects to anything.
+- **Admission capacity.** Optional `QUEUE_MAX_WAITING` and `TENANT_MAX_INFLIGHT` default to `0` (disabled). Waiting includes paused and prioritized jobs; tenant inflight also includes active jobs, delayed retries and waiting-children jobs. A Redis script checks and inserts atomically across API replicas. Full capacity returns `429` and `Retry-After: 1`; idempotent replays remain available. A tenant's finite inflight quota bounds its backlog, but workers still use FIFO rather than a strict fair scheduler.
 - **Job types.** `PROCESS_DOCUMENT` returns character count, word count, and a SHA-256 of the content. `SEND_NOTIFICATION` records a processed result. `PROCESS_INVOICE` calls `BillingMockService` through a circuit breaker; the mock waits 1.5–3 seconds and throws `BillingServiceException` with probability `BILLING_FAILURE_RATE` (default 0.2).
 - **Payload re-validation.** The worker parses `job.data` with the same Zod schema before executing. Redis is a trust boundary: a malformed job (manual insert, schema drift between deploys) throws BullMQ's `UnrecoverableError` and fails once instead of burning five attempts.
+- **Payload version.** `schemaVersion` is optional and defaults semantically to `1`; version `1` is currently the only supported value. The API rejects other versions with `400`, and workers reject unsupported stored versions without retrying. Omitting the field and explicitly setting it to `1` have the same idempotency fingerprint, including for previously accepted jobs.
 - **Retry policy.** Every job is created with `attempts: TASK_MAX_ATTEMPTS` (default 5) and exponential backoff starting at `TASK_BACKOFF_DELAY_MS` (default 2 seconds). BullMQ computes the delay as `round(delay * 2^(attemptsMade - 1))` with no jitter: with the defaults, 2s, 4s, 8s, then 16s between the five attempts. Billing errors, circuit-open errors, and timeouts are retryable; invalid payloads are not.
 - **Per-job timeout.** Each handler runs under `JOB_TIMEOUT_MS` (default 30 seconds) with an `AbortSignal`. The billing mock honours the signal. On expiry the attempt fails with `TaskTimeoutError` and is retried.
 - **Visibility and retention.** The worker keeps BullMQ 5 lock defaults: a 30 second lock, renewal at 15 seconds, a stalled check every 30 seconds, and `maxStalledCount` of 1. Completed jobs are kept for 24 hours or 1,000 jobs; failed jobs for 7 days or 5,000 jobs. A job that reaches the terminal failed state is also copied to the `tasks-dead-letter` queue, which has no retention limit.
@@ -105,6 +107,7 @@ The machine-readable contract is [openapi.yaml](./openapi.yaml), validated in th
 | `POST /admin/api/dead-letter/:taskId/replay` | Basic                     | Re-enqueue as a new job owned by the original tenant; `202` with `taskId` and `replayOf`       |
 | `DELETE /admin/api/dead-letter/:taskId`      | Basic                     | Discard an entry; `204`                                                                        |
 | `GET /admin/api/audit?limit`                 | Basic                     | Newest admin audit records (1–1000, default 100)                                               |
+| `POST /admin/api/secrets/reload`             | Admin                     | Reload API keys on this replica and audit the result                                           |
 
 With `ADMIN_AUTH_MODE=basic` (default), the admin surface returns `503` until `ADMIN_PASSWORD` (at least 12 characters) is configured, so a default deployment never exposes it anonymously. Basic credentials are compared in constant time and grant the effective `admin` role. The table above describes this default; OIDC accepts Bearer tokens or browser sessions instead. After `ADMIN_AUTH_MAX_FAILURES` rejected logins (default 10) from one client IP within `ADMIN_AUTH_WINDOW_MS` (default 15 minutes), every `/admin` request from that IP returns `429` until the window ends; successful requests, such as Bull Board's polling, are not counted. Only the `api` and `all` roles mount the task and admin routes.
 
@@ -114,15 +117,17 @@ With `ADMIN_AUTH_MODE=basic` (default), the admin surface returns `503` until `A
 
 Logs are Pino JSON on stdout with `service` and `role` on every line. `pino-http` logs each request with its `X-Request-Id` (accepted from the client when it matches `[A-Za-z0-9._-]{1,128}`, otherwise generated, and always echoed). The same id is stored in `job.data.meta.requestId` and appears on worker logs, so one request can be followed from HTTP to the last attempt. `Authorization`, cookies, `Idempotency-Key`, `X-API-Key`, and password fields are redacted. Health and metrics requests are not logged.
 
-| Metric                             | Type      | Labels                                            |
-| ---------------------------------- | --------- | ------------------------------------------------- |
-| `http_request_duration_seconds`    | histogram | `method`, `route`, `status_code`                  |
-| `tasks_enqueued_total`             | counter   | `task_type`, `replayed`                           |
-| `tasks_processed_total`            | counter   | `task_type`, `outcome` (one per attempt)          |
-| `task_processing_duration_seconds` | histogram | `task_type`, `outcome`                            |
-| `tasks_dead_lettered_total`        | counter   | `task_type`                                       |
-| `circuit_breaker_state`            | gauge     | `circuit` (0 closed, 1 half-open, 2 open)         |
-| `queue_jobs`                       | gauge     | `queue`, `state` (read from Redis at scrape time) |
+| Metric                               | Type      | Labels                                            |
+| ------------------------------------ | --------- | ------------------------------------------------- |
+| `http_request_duration_seconds`      | histogram | `method`, `route`, `status_code`                  |
+| `tasks_enqueued_total`               | counter   | `task_type`, `replayed`                           |
+| `task_backpressure_rejections_total` | counter   | `reason` (`queue` or `tenant`)                    |
+| `tenant_tasks_inflight`              | gauge     | `tenant` (current jobs in Redis)                  |
+| `tasks_processed_total`              | counter   | `task_type`, `outcome` (one per attempt)          |
+| `task_processing_duration_seconds`   | histogram | `task_type`, `outcome`                            |
+| `tasks_dead_lettered_total`          | counter   | `task_type`                                       |
+| `circuit_breaker_state`              | gauge     | `circuit` (0 closed, 1 half-open, 2 open)         |
+| `queue_jobs`                         | gauge     | `queue`, `state` (read from Redis at scrape time) |
 
 Node.js runtime metrics (event loop lag, heap, GC) are included. Successful `GET /admin/queues/**` requests (Bull Board polls every few seconds) are logged at `debug` instead of `info`; errors on them are still `warn`/`error`.
 
@@ -140,6 +145,8 @@ Node.js runtime metrics (event loop lag, heap, GC) are included. Successful `GET
 | `REDIS_URL`                                        | —                                 | Wins over host/port/password                                                                                                                            |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD`     | `127.0.0.1` / `6379` / —          | `REDIS_PASSWORD` is required by Docker Compose                                                                                                          |
 | `WORKER_CONCURRENCY`                               | `10`                              | 1–1000                                                                                                                                                  |
+| `QUEUE_MAX_WAITING` / `TENANT_MAX_INFLIGHT`        | `0` / `0`                         | Maximum waiting jobs / per-tenant inflight jobs; zero disables each limit                                                                               |
+| `SECRETS_REFRESH_INTERVAL_MS` / `API_KEYS_FILE`    | `0` / —                           | Periodic refresh interval (zero disables) / mounted file for env-mode API keys                                                                          |
 | `JOB_TIMEOUT_MS`                                   | `30000`                           | 1,000–600,000                                                                                                                                           |
 | `SHUTDOWN_TIMEOUT_MS`                              | `25000`                           | Keep below the orchestrator grace period                                                                                                                |
 | `BILLING_FAILURE_RATE`                             | `0.2`                             | 0–1; `1` forces every invoice to the dead-letter queue                                                                                                  |
@@ -161,7 +168,7 @@ Node.js runtime metrics (event loop lag, heap, GC) are included. Successful `GET
 
 ## What Is Not Implemented
 
-There is no transactional outbox: task acceptance writes to Redis only. Optional WORM audit archival is best-effort, not an atomic dual write with Redis. API keys are startup configuration: there is no self-service issuance or automatic expiry (rotate by adding the new key under the same tenant and removing the old one). Vault/AppRole secrets are loaded once, without live rotation or token renewal. Sentinel restores access to a promoted replica, but asynchronous replication can lose acknowledged writes and is not a zero-data-loss guarantee. OIDC sessions end at access-token expiry, without refresh or immediate token revocation checks. The idempotency window ends when BullMQ's retention removes the job. Results live only as long as that retention. Timeouts are per process; the circuit is shared in Redis and counts consecutive completions rather than failures in a rolling time window. The dead-letter copy is not atomic with the failure (see above). The audit stream is capped and lives in the same Redis; optional S3 Object Lock protects successfully archived object versions, but there is no automatic retry/backfill or cryptographic audit chain. The billing service is a mock and notifications are not sent. Redis Cluster and Helm/Kubernetes manifests remain future work.
+There is no transactional outbox: task acceptance writes to Redis only. Optional WORM audit archival is best-effort, not an atomic dual write with Redis. API keys have no self-service issuance or automatic expiry. API key reload does not rotate Redis, OIDC, admin or archive credentials, and Vault token renewal is not implemented. Sentinel restores access to a promoted replica, but asynchronous replication can lose acknowledged writes and is not a zero-data-loss guarantee. OIDC sessions end at access-token expiry, without refresh or immediate token revocation checks. The idempotency window ends when BullMQ's retention removes the job. Results live only as long as that retention. Timeouts are per process; the circuit is shared in Redis and counts consecutive completions rather than failures in a rolling time window. The dead-letter copy is not atomic with the failure (see above). The audit stream is capped and lives in the same Redis; optional S3 Object Lock protects successfully archived object versions, but there is no automatic retry/backfill or cryptographic audit chain. The billing service is a mock and notifications are not sent. Redis Cluster and Helm/Kubernetes manifests remain future work.
 
 ## Testing Strategy
 
@@ -571,12 +578,21 @@ logged or written to `.env` files.
 | `VAULT_DEV_ROOT_TOKEN`              | Local OpenBao profile only; default `local-openbao-root-token`                                                         |
 
 Missing credentials/address/path, rejected tokens, unavailable storage, timeout,
-wrong KV versions, empty secrets or non-string sensitive values abort startup
+wrong KV versions, invalid secrets or non-string sensitive values abort startup
 with exit code 1 and sanitized diagnostics. There is **no fallback to env mode**
 after a Vault failure. Final app configuration is also validated before clients
-are created. Secrets are loaded only at startup; rotate credentials by updating
-Vault and restarting all API/worker replicas. Token renewal and live reload are
-not implemented. Preserve tenant IDs when rotating API keys.
+are created. `API_KEYS` alone can be reloaded without restarting. Update it in
+Vault/OpenBao, or in a file mounted into each process and named by `API_KEYS_FILE`
+when using the env provider. Process environment variables themselves cannot be
+changed from outside a running process. Set `SECRETS_REFRESH_INTERVAL_MS` to a
+positive interval or call `POST /admin/api/secrets/reload` on **each** API replica
+using an admin credential. The endpoint is audited; viewer access is denied.
+Changes apply when each reload succeeds, not simultaneously across replicas. Failures
+are logged and retain the previous keys. If all keys are removed after authentication
+was enabled, requests are denied rather than becoming anonymous. Preserve tenant IDs
+while overlapping old and new keys. Vault keys absent from the secret fall back to the
+original environment; explicitly set `API_KEYS` to an empty string to revoke all.
+Other secrets and Vault auth credentials require restart; token renewal is not implemented.
 
 The optional `secrets` profile runs OpenBao in **development mode**: in-memory
 storage, loopback port 8200, a known root token which the dev server prints, and
@@ -747,3 +763,16 @@ git commit -m "Initial import"
 git remote add origin https://github.com/<you>/<repo>.git
 git push -u origin main   # triggers .github/workflows/ci.yml
 ```
+
+## Operational reliability
+
+The default stack and fast CI remain unchanged. Optional durable audit delivery,
+DLQ reconciliation, verified encrypted off-host backups, isolated load/failure/restore
+drills and a hardened production Compose overlay are documented in
+[the operational contract and runbook](ops/OPERATIONS.md).
+
+Targets: monthly availability 99.9%, acceptance p95 <= 500ms, document completion
+p95 <= 5s under the declared workload, and RPO/RTO <= 15min. These are objectives,
+not an exactly-once/zero-loss or single-host HA guarantee. Run `npm run ops:reliability`
+for measured technical evidence; full incident RTO and monthly availability need
+external monitoring and real recovery exercises.

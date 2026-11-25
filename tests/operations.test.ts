@@ -10,13 +10,18 @@ const mocks = vi.hoisted(() => ({
   getWaitingCount: vi.fn(),
 }));
 
-vi.mock('../src/config/redis.js', () => ({ redis: {}, coordinationRedis: {}, pingRedis: vi.fn() }));
+vi.mock('../src/config/redis.js', () => ({
+  redis: { eval: vi.fn(async () => []) },
+  coordinationRedis: {},
+  pingRedis: vi.fn(),
+}));
 
 vi.mock('../src/queues/task.queue.js', () => ({
   TASK_QUEUE_NAME: 'tasks',
   TASK_MAX_ATTEMPTS: 5,
   taskQueue: {
     name: 'tasks',
+    toKey: (key: string) => `bull:tasks:${key}`,
     add: mocks.add,
     getJob: vi.fn(),
     getJobCounts: vi.fn(async () => ({ waiting: 3, failed: 1 })),

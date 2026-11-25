@@ -1,13 +1,19 @@
 import { z } from 'zod';
 
+const schemaVersion = z
+  .literal(1, { error: 'Unsupported schemaVersion; supported version: 1' })
+  .optional();
+
 export const processDocumentPayloadSchema = z.object({
   type: z.literal('PROCESS_DOCUMENT'),
+  schemaVersion,
   documentId: z.string().trim().min(1).max(200),
   content: z.string().min(1).max(1_000_000),
 });
 
 export const sendNotificationPayloadSchema = z.object({
   type: z.literal('SEND_NOTIFICATION'),
+  schemaVersion,
   recipient: z.email().max(320),
   subject: z.string().trim().min(1).max(200),
   message: z.string().min(1).max(10_000),
@@ -15,6 +21,7 @@ export const sendNotificationPayloadSchema = z.object({
 
 export const processInvoicePayloadSchema = z.object({
   type: z.literal('PROCESS_INVOICE'),
+  schemaVersion,
   customerId: z.string().trim().min(1).max(200),
   amount: z.number().positive(),
   currency: z.string().trim().min(1).max(10),

@@ -4,6 +4,7 @@ import { getRequestId, getTenantId } from '../middleware/http.middleware.js';
 import { tasksEnqueuedTotal } from '../observability/metrics.js';
 import { dispatchTask, getTaskStatus } from '../services/task.service.js';
 import { idempotencyKeySchema, taskIdSchema, taskPayloadSchema } from '../types/task.types.js';
+import type { AdmissionLimits } from '../queues/admission.js';
 
 export const processTask: RequestHandler = async (request, response, next) => {
   const rawKey = request.header('idempotency-key');
@@ -41,6 +42,7 @@ export const processTask: RequestHandler = async (request, response, next) => {
       requestId,
       tenantId,
       idempotencyKey: parsedKey?.data,
+      limits: response.locals.admissionLimits as AdmissionLimits | undefined,
     });
     trace.getActiveSpan()?.setAttribute('task.id', accepted.taskId);
     tasksEnqueuedTotal.inc({ task_type: accepted.taskType, replayed: String(replayed) });

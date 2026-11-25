@@ -3,6 +3,8 @@ import { SpanKind, trace } from '@opentelemetry/api';
 import { currentTraceContext, withSpan } from '../observability/tracing.js';
 import { deadLetterJobId, deadLetterQueue } from '../queues/dead-letter.queue.js';
 import { taskQueue } from '../queues/task.queue.js';
+import { addWithAdmission, type AdmissionLimits } from '../queues/admission.js';
+import { config } from '../config/env.js';
 import {
   PUBLIC_TENANT_ID,
   type TaskAcceptedResponse,
@@ -26,6 +28,7 @@ export interface DispatchOptions {
   tenantId: string;
   idempotencyKey?: string;
   replayOf?: string;
+  limits?: AdmissionLimits;
 }
 
 export interface DispatchResult {
@@ -36,7 +39,10 @@ export interface DispatchResult {
 const sha256 = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
 
 // Zod emits keys in schema order, so JSON.stringify of a parsed payload is deterministic.
-export const payloadFingerprint = (payload: TaskPayload): string => sha256(JSON.stringify(payload));
+export const payloadFingerprint = (payload: TaskPayload): string => {
+  const { schemaVersion: _schemaVersion, ...versionOnePayload } = payload;
+  return sha256(JSON.stringify(versionOnePayload));
+};
 
 // BullMQ custom ids may not contain ":" or be integers; a hex digest avoids both.
 // The tenant is part of the digest so two tenants can use the same key independently.
@@ -70,11 +76,12 @@ export const dispatchTask = async (
         ? idempotentJobId(options.tenantId, options.idempotencyKey)
         : undefined;
 
-      const job = await taskQueue.add(
-        payload.type,
-        { ...payload, meta },
-        jobId ? { jobId } : undefined,
-      );
+      const limits = options.limits ?? config;
+      const data = { ...payload, meta };
+      const job =
+        limits.QUEUE_MAX_WAITING || limits.TENANT_MAX_INFLIGHT
+          ? await addWithAdmission(payload.type, data, options.tenantId, limits, jobId)
+          : await taskQueue.add(payload.type, data, jobId ? { jobId } : undefined);
 
       if (!job.id) {
         throw new Error('Queue accepted the task without assigning a job ID');

@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   error: vi.fn(),
   processed: vi.fn(),
   duration: vi.fn(),
+  endToEnd: vi.fn(),
   state: vi.fn(),
 }));
 
@@ -25,6 +26,7 @@ vi.mock('../src/config/logger.js', () => ({ logger: mocks }));
 vi.mock('../src/observability/metrics.js', () => ({
   tasksProcessedTotal: { inc: mocks.processed },
   taskDuration: { observe: mocks.duration },
+  taskEndToEndDuration: { observe: mocks.endToEnd },
   setCircuitState: mocks.state,
 }));
 vi.mock('../src/queues/task.queue.js', () => ({ TASK_QUEUE_NAME: 'tasks' }));
@@ -41,6 +43,7 @@ const job = {
   opts: {},
   attemptsMade: 1,
   processedOn: 1_000,
+  timestamp: 500,
   finishedOn: 2_500,
   failedReason: '',
   getState: vi.fn(async () => 'failed'),
@@ -69,6 +72,8 @@ describe('worker events', () => {
     expect(mocks.processed).toHaveBeenCalledWith({ task_type: job.name, outcome: 'completed' });
     expect(mocks.processed).toHaveBeenCalledWith({ task_type: job.name, outcome: 'failed' });
     expect(mocks.duration).toHaveBeenCalledWith({ task_type: job.name, outcome: 'failed' }, 1.5);
+    expect(mocks.endToEnd).toHaveBeenCalledWith({ task_type: job.name, outcome: 'completed' }, 2);
+    expect(mocks.endToEnd).toHaveBeenCalledWith({ task_type: job.name, outcome: 'failed' }, 2);
     expect(mocks.add).toHaveBeenCalledWith(
       expect.objectContaining({ failedReason: 'failure', originalJobId: '42' }),
     );
@@ -84,6 +89,18 @@ describe('worker events', () => {
       expect.objectContaining({ err: expect.any(Error) }),
       'Task worker error',
     );
+  });
+
+  it('does not count a retry as a terminal end-to-end outcome', () => {
+    const worker = createTaskWorker();
+    const finishedOn = job.finishedOn;
+    job.finishedOn = undefined;
+    try {
+      worker.emit('failed', job, new Error('retry'), 'active');
+      expect(mocks.endToEnd).not.toHaveBeenCalled();
+    } finally {
+      job.finishedOn = finishedOn;
+    }
   });
 
   it('logs DLQ write failures and ignores jobs without an id', async () => {

@@ -111,6 +111,18 @@ describe('task processor', () => {
     );
   });
 
+  it('processes version 1 and rejects unsupported versions without retrying', async () => {
+    const processor = buildProcessor(instantBilling(0));
+    const document = { type: 'PROCESS_DOCUMENT', documentId: 'doc-1', content: 'hello' };
+    await expect(processor(fakeJob({ ...document, schemaVersion: 1 }))).resolves.toMatchObject({
+      taskType: 'PROCESS_DOCUMENT',
+    });
+    await expect(processor(fakeJob({ ...document, schemaVersion: 2 }))).rejects.toMatchObject({
+      name: 'UnrecoverableError',
+      message: expect.stringContaining('schemaVersion'),
+    });
+  });
+
   it('aborts a handler that exceeds the job timeout', async () => {
     let receivedSignal: AbortSignal | undefined;
     const hangingBilling: BillingGateway = {

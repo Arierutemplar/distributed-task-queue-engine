@@ -1,8 +1,8 @@
 import type { RedisOptions } from 'ioredis';
-import type { AppConfig } from './env.js';
+import type { RedisSettings } from './redis-settings.js';
 
 export const resolveRedisConnection = (
-  settings: AppConfig,
+  settings: RedisSettings,
   sharedOptions: RedisOptions = {},
 ): { url?: string; options: RedisOptions } => {
   if (settings.REDIS_SENTINEL_HOSTS && settings.REDIS_SENTINEL_MASTER_NAME) {

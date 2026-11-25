@@ -1,0 +1,66 @@
+# Test-only, private fixture. Never deploy this fake S3 service in production.
+services:
+  app:
+    ports: !reset []
+    environment:
+      ADMIN_AUTH_MODE: basic
+      OIDC_ISSUER_URL: ''
+      OIDC_PUBLIC_ISSUER_URL: ''
+      OIDC_REDIRECT_URI: ''
+      SECRETS_PROVIDER: env
+      PRODUCTION_HARDENING_ENABLED: 'false'
+      AUDIT_WORM_ENABLED: 'true'
+      AUDIT_WORM_ENDPOINT: http://minio:9000
+      AUDIT_WORM_ACCESS_KEY_ID: fixture
+      AUDIT_WORM_SECRET_ACCESS_KEY: fixture-only-secret
+      AUDIT_WORM_DELIVERY: outbox
+      AUDIT_WORM_LOCK_MODE: COMPLIANCE
+      AUDIT_WORM_TIMEOUT_MS: '1000'
+      AUDIT_OUTBOX_ATTEMPTS: '2'
+      AUDIT_OUTBOX_BACKOFF_MS: '100'
+      DLQ_RECONCILE_ENABLED: 'true'
+      MAINTENANCE_INTERVAL_MS: '1000'
+      RATE_LIMIT_MAX: '0'
+      RATE_LIMIT_TENANT_MAX: '0'
+      OTEL_ENABLED: 'false'
+    depends_on:
+      fixture-s3:
+        condition: service_healthy
+  redis:
+    ports: !reset []
+  redis-sentinel-1:
+    ports: !reset []
+  redis-sentinel-2:
+    ports: !reset []
+  redis-sentinel-3:
+    ports: !reset []
+  fixture-s3:
+    image: ${OPERATIONS_IMAGE:-distributed-task-queue-operations:local}
+    command: ['node', 'ops/reliability/fixture-s3.js']
+    volumes: ['fixture_data:/app/fixture-data']
+    networks:
+      queue-net:
+        aliases: [minio]
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:9000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+  backup:
+    environment:
+      DRILL_API_KEY: ${API_KEYS}
+      DRILL_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      BACKUP_S3_ENDPOINT: http://fixture-s3:9000
+      BACKUP_S3_BUCKET: fixture-backups
+      BACKUP_S3_ACCESS_KEY_ID: fixture
+      BACKUP_S3_SECRET_ACCESS_KEY: fixture-only-secret
+      SECRETS_PROVIDER: env
+      PRODUCTION_HARDENING_ENABLED: 'false'
+volumes:
+  fixture_data:

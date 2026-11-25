@@ -10,6 +10,7 @@ import { closeConnections, resetState, waitFor } from './helpers.js';
 const apiKey = 'vault-api-key-0123456789abcdef0123456789';
 const password = 'vault-loaded-admin-password';
 const vaultToken = 'vault-child-token';
+let vaultKeys = apiKey;
 let vault: Server;
 let address: string;
 let redisUrl = TEST_REDIS_URL;
@@ -30,7 +31,7 @@ beforeAll(async () => {
       JSON.stringify({
         data: {
           data: {
-            API_KEYS: apiKey,
+            API_KEYS: vaultKeys,
             ADMIN_PASSWORD: password,
             REDIS_URL: redisUrl,
           },
@@ -43,6 +44,7 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   redisUrl = TEST_REDIS_URL;
+  vaultKeys = apiKey;
   await resetState();
 });
 afterAll(async () => {
@@ -113,11 +115,87 @@ const start = (env: NodeJS.ProcessEnv) => {
 };
 
 describe('preload before runtime configuration for API and worker entry points', () => {
+  it('reloads Vault keys through the admin endpoint and periodically, without reopening access', async () => {
+    const port = await freePort();
+    const process = start({
+      PROCESS_ROLE: 'api',
+      PORT: String(port),
+      SECRETS_REFRESH_INTERVAL_MS: '100',
+    });
+    const base = `http://127.0.0.1:${port}`;
+    const nextKey = 'vault-next-key-0123456789abcdef01234567';
+    const check = (key?: string) =>
+      fetch(`${base}/api/v1/tasks/missing`, { headers: key ? { 'X-API-Key': key } : {} });
+    const authorization = `Basic ${Buffer.from(`admin:${password}`).toString('base64')}`;
+    try {
+      await waitFor(async () => {
+        if (process.child.exitCode !== null) throw new Error(process.output());
+        try {
+          return (await fetch(`${base}/health/ready`)).ok;
+        } catch (error: unknown) {
+          if (error instanceof TypeError) return false;
+          throw error;
+        }
+      }, 'child process readiness');
+      vaultKeys = `acme:${apiKey},acme:${nextKey}`;
+      expect(
+        (
+          await fetch(`${base}/admin/api/secrets/reload`, {
+            method: 'POST',
+            headers: { Authorization: authorization },
+          })
+        ).status,
+      ).toBe(200);
+      expect((await check(apiKey)).status).toBe(404);
+      expect((await check(nextKey)).status).toBe(404);
+      vaultKeys = `acme:${nextKey}`;
+      await waitFor(async () => (await check(apiKey)).status === 401, 'periodic key revocation');
+      expect((await check(nextKey)).status).toBe(404);
+      vaultKeys = 'invalid-short-key';
+      expect(
+        (
+          await fetch(`${base}/admin/api/secrets/reload`, {
+            method: 'POST',
+            headers: { Authorization: authorization },
+          })
+        ).status,
+      ).toBe(500);
+      expect((await check(nextKey)).status).toBe(404);
+      vaultKeys = '';
+      expect(
+        (
+          await fetch(`${base}/admin/api/secrets/reload`, {
+            method: 'POST',
+            headers: { Authorization: authorization },
+          })
+        ).status,
+      ).toBe(200);
+      expect((await check()).status).toBe(401);
+      expect((await check(nextKey)).status).toBe(401);
+      const audit = (await (
+        await fetch(`${base}/admin/api/audit`, {
+          headers: { Authorization: authorization },
+        })
+      ).json()) as { items: { action: string; outcome: string }[] };
+      expect(audit.items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ action: 'admin.secrets_reload', outcome: 'success' }),
+        ]),
+      );
+    } finally {
+      process.child.kill();
+      await process.exited;
+    }
+  });
   it('does not leak Vault-loaded credentials in Redis authentication error command arguments', async () => {
     const privatePassword = 'disposable-auth-secret-0123456789';
     const sockets = new Set<Socket>();
+    const peerErrors: NodeJS.ErrnoException[] = [];
     const endpoint = createTcpServer((socket) => {
       sockets.add(socket);
+      socket.on('error', (error: NodeJS.ErrnoException) => {
+        peerErrors.push(error);
+      });
       socket.on('close', () => {
         sockets.delete(socket);
       });
@@ -145,6 +223,8 @@ describe('preload before runtime configuration for API and worker entry points',
         }),
       );
     }
+    // The intentionally rejected/killed client can reset its TCP connection on Windows.
+    for (const error of peerErrors) expect(error.code, error.message).toBe('ECONNRESET');
   });
 
   it.each(['api', 'worker'])(

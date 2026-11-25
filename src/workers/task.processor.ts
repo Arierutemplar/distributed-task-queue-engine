@@ -1,14 +1,13 @@
-import { createHash } from 'node:crypto';
 import { UnrecoverableError, type Job } from 'bullmq';
 import { SpanKind } from '@opentelemetry/api';
 import type { Logger } from 'pino';
 import type { BillingGateway } from '../services/billing.mock.service.js';
+import { processDocument } from '../services/document.service.js';
 import { withTimeout } from '../resilience/timeout.js';
 import { rememberJobAttempt, withJobSpan, withSpan } from '../observability/tracing.js';
 import {
   taskPayloadSchema,
   type TaskJobData,
-  type TaskPayload,
   type TaskResult,
   type TaskType,
 } from '../types/task.types.js';
@@ -21,20 +20,6 @@ export interface TaskProcessorDependencies {
   timeoutMs: number;
   logger: Logger;
 }
-
-const processDocument = (
-  payload: Extract<TaskPayload, { type: 'PROCESS_DOCUMENT' }>,
-): TaskResult => {
-  const trimmedContent = payload.content.trim();
-  return {
-    taskType: 'PROCESS_DOCUMENT',
-    documentId: payload.documentId,
-    characterCount: Array.from(payload.content).length,
-    wordCount: trimmedContent.length === 0 ? 0 : trimmedContent.split(/\s+/u).length,
-    sha256: createHash('sha256').update(payload.content, 'utf8').digest('hex'),
-    completedAt: new Date().toISOString(),
-  };
-};
 
 export const createTaskProcessor =
   (dependencies: TaskProcessorDependencies) =>

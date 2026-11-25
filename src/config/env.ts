@@ -1,6 +1,6 @@
 import './dotenv.js';
-import { isIP } from 'node:net';
 import { z } from 'zod';
+import { redisSettingsSchema, validateRedisPair } from './redis-settings.js';
 
 const booleanFromString = z
   .enum(['true', 'false', '1', '0'])
@@ -8,35 +8,6 @@ const booleanFromString = z
 
 const emptyToUndefined = (value: unknown): unknown =>
   typeof value === 'string' && value.trim() === '' ? undefined : value;
-
-const sentinelHosts = z
-  .preprocess(emptyToUndefined, z.string().optional())
-  .transform((value, context) => {
-    if (!value) return undefined;
-    const nodes: { host: string; port: number }[] = [];
-    for (const entry of value.split(',')) {
-      const match = /^(?:\[([A-Fa-f0-9:]+)\]|([A-Za-z0-9._-]+)):(\d+)$/u.exec(entry.trim());
-      const port = Number(match?.[3]);
-      const bracketed = entry.trim().startsWith('[');
-      const host = match ? (bracketed ? match[1] : match[2]) : undefined;
-      if (
-        !match ||
-        !host ||
-        (bracketed && isIP(host) !== 6) ||
-        !Number.isInteger(port) ||
-        port < 1 ||
-        port > 65_535
-      ) {
-        context.addIssue({
-          code: 'custom',
-          message: 'must be comma-separated host:port entries (IPv6 uses [address]:port)',
-        });
-        return z.NEVER;
-      }
-      nodes.push({ host, port });
-    }
-    return nodes;
-  });
 
 const TENANT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/u;
 const MIN_API_KEY_LENGTH = 32;
@@ -62,7 +33,7 @@ export const parseApiKeyEntry = (entry: string): ApiKeyEntry => {
   return { key: entry };
 };
 
-const apiKeysSchema = z.preprocess(
+export const apiKeysSchema = z.preprocess(
   (value) =>
     typeof value === 'string'
       ? value
@@ -102,26 +73,15 @@ export const envSchema = z
     PORT: z.coerce.number().int().min(1).max(65_535).default(3_000),
     PROCESS_ROLE: z.enum(['all', 'api', 'worker']).default('all'),
     SECRETS_PROVIDER: z.preprocess(emptyToUndefined, z.enum(['env', 'vault']).default('env')),
+    SECRETS_REFRESH_INTERVAL_MS: z.coerce.number().int().min(0).max(86_400_000).default(0),
+    API_KEYS_FILE: z.preprocess(emptyToUndefined, z.string().optional()),
     TRUST_PROXY: z.coerce.number().int().min(0).max(10).default(0),
 
-    REDIS_URL: z.preprocess(emptyToUndefined, z.url().optional()),
-    REDIS_HOST: z.string().trim().min(1).default('127.0.0.1'),
-    REDIS_PORT: z.coerce.number().int().min(1).max(65_535).default(6_379),
-    REDIS_PASSWORD: z.preprocess(emptyToUndefined, z.string().optional()),
-    REDIS_USERNAME: z.preprocess(emptyToUndefined, z.string().optional()),
-    REDIS_SENTINEL_HOSTS: sentinelHosts,
-    REDIS_SENTINEL_MASTER_NAME: z.preprocess(
-      emptyToUndefined,
-      z
-        .string()
-        .trim()
-        .regex(/^[A-Za-z0-9._-]+$/u)
-        .optional(),
-    ),
-    REDIS_SENTINEL_USERNAME: z.preprocess(emptyToUndefined, z.string().optional()),
-    REDIS_SENTINEL_PASSWORD: z.preprocess(emptyToUndefined, z.string().optional()),
+    ...redisSettingsSchema.shape,
 
     WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(1_000).default(10),
+    QUEUE_MAX_WAITING: z.coerce.number().int().min(0).max(1_000_000).default(0),
+    TENANT_MAX_INFLIGHT: z.coerce.number().int().min(0).max(1_000_000).default(0),
     JOB_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(600_000).default(30_000),
     SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(25_000),
     TASK_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(50).default(5),
@@ -156,6 +116,14 @@ export const envSchema = z
     ADMIN_AUTH_WINDOW_MS: z.coerce.number().int().min(1_000).default(900_000),
     AUDIT_LOG_MAX_ENTRIES: z.coerce.number().int().min(0).max(1_000_000).default(10_000),
     AUDIT_WORM_ENABLED: z.preprocess(emptyToUndefined, booleanFromString.default(false)),
+    AUDIT_WORM_DELIVERY: z.enum(['direct', 'outbox']).default('direct'),
+    AUDIT_OUTBOX_ATTEMPTS: z.coerce.number().int().min(1).max(50).default(5),
+    AUDIT_OUTBOX_BACKOFF_MS: z.coerce.number().int().min(10).max(60_000).default(1_000),
+    AUDIT_OUTBOX_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(2),
+    DLQ_RECONCILE_ENABLED: z.preprocess(emptyToUndefined, booleanFromString.default(false)),
+    MAINTENANCE_INTERVAL_MS: z.coerce.number().int().min(100).max(300_000).default(30_000),
+    MAINTENANCE_BATCH_SIZE: z.coerce.number().int().min(1).max(1_000).default(100),
+    PRODUCTION_HARDENING_ENABLED: z.preprocess(emptyToUndefined, booleanFromString.default(false)),
     AUDIT_WORM_ENDPOINT: z.preprocess(emptyToUndefined, z.url().optional()),
     AUDIT_WORM_REGION: z.string().trim().min(1).default('us-east-1'),
     AUDIT_WORM_BUCKET: z
@@ -176,13 +144,56 @@ export const envSchema = z
     OTEL_SERVICE_NAME: z.preprocess(emptyToUndefined, z.string().trim().min(1).optional()),
   })
   .superRefine((settings, context) => {
-    if (Boolean(settings.REDIS_SENTINEL_HOSTS) !== Boolean(settings.REDIS_SENTINEL_MASTER_NAME)) {
+    if (
+      settings.AUDIT_WORM_DELIVERY === 'outbox' &&
+      (!settings.AUDIT_WORM_ENABLED ||
+        !settings.AUDIT_WORM_ACCESS_KEY_ID ||
+        !settings.AUDIT_WORM_SECRET_ACCESS_KEY)
+    ) {
       context.addIssue({
         code: 'custom',
-        path: ['REDIS_SENTINEL_HOSTS'],
-        message: 'REDIS_SENTINEL_HOSTS and REDIS_SENTINEL_MASTER_NAME must be configured together',
+        path: ['AUDIT_WORM_DELIVERY'],
+        message: 'outbox requires WORM enabled and complete writer credentials',
       });
     }
+    if (settings.PRODUCTION_HARDENING_ENABLED) {
+      const invalid = (field: string, message: string): void => {
+        context.addIssue({ code: 'custom', path: [field], message });
+      };
+      if (settings.NODE_ENV !== 'production') invalid('NODE_ENV', 'must be production');
+      if (!settings.DLQ_RECONCILE_ENABLED) invalid('DLQ_RECONCILE_ENABLED', 'must be enabled');
+      if (settings.SHUTDOWN_TIMEOUT_MS <= settings.JOB_TIMEOUT_MS)
+        invalid('SHUTDOWN_TIMEOUT_MS', 'must exceed the job execution budget');
+      if (settings.AUDIT_WORM_DELIVERY !== 'outbox')
+        invalid('AUDIT_WORM_DELIVERY', 'must be outbox');
+      if (settings.AUDIT_WORM_LOCK_MODE !== 'COMPLIANCE')
+        invalid('AUDIT_WORM_LOCK_MODE', 'must be COMPLIANCE');
+      if (
+        settings.AUDIT_WORM_ENDPOINT &&
+        new URL(settings.AUDIT_WORM_ENDPOINT).protocol !== 'https:'
+      )
+        invalid('AUDIT_WORM_ENDPOINT', 'production archival requires HTTPS');
+      if (!settings.REDIS_URL && !settings.REDIS_PASSWORD)
+        invalid('REDIS_PASSWORD', 'private Redis requires authentication');
+      if (settings.REDIS_URL && new URL(settings.REDIS_URL).protocol !== 'rediss:')
+        invalid('REDIS_URL', 'external production Redis requires rediss://');
+      if (settings.PROCESS_ROLE !== 'worker') {
+        if (settings.ADMIN_AUTH_MODE !== 'oidc') invalid('ADMIN_AUTH_MODE', 'must be oidc');
+        if (settings.TRUST_PROXY < 1)
+          invalid('TRUST_PROXY', 'must trust the configured TLS proxy hop');
+        if (settings.CORS_ORIGINS === '*')
+          invalid('CORS_ORIGINS', 'must use explicit production origins');
+        for (const field of [
+          'OIDC_ISSUER_URL',
+          'OIDC_PUBLIC_ISSUER_URL',
+          'OIDC_REDIRECT_URI',
+        ] as const) {
+          if (!settings[field] || new URL(settings[field]).protocol !== 'https:')
+            invalid(field, 'production OIDC requires an explicit HTTPS URL');
+        }
+      }
+    }
+    validateRedisPair(settings, context);
     if (settings.AUDIT_WORM_ENDPOINT) {
       const endpoint = new URL(settings.AUDIT_WORM_ENDPOINT);
       const local = ['localhost', '127.0.0.1', '[::1]', 'minio'].includes(endpoint.hostname);

@@ -1,0 +1,66 @@
+groups:
+  - name: task-queue-operational
+    rules:
+      - record: task_queue:api_acceptance:p95_seconds
+        expr: histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket{method="POST",route="/api/v1/tasks/process",status_code="202"}[5m])))
+      - record: task_queue:document_completion:p95_seconds
+        expr: histogram_quantile(0.95, sum by (le, service) (rate(task_end_to_end_duration_seconds_bucket{task_type="PROCESS_DOCUMENT",outcome="completed"}[5m])))
+      - alert: TaskQueueApiUnavailable
+        expr: up{job="task-queue-api"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          { summary: 'API scrape unavailable; verify external TLS synthetic probe and readiness' }
+      - alert: TaskQueueApiErrorBudgetBurn
+        expr: sum by (service) (rate(http_request_duration_seconds_count{role="api",route=~"/api/v1/tasks.*",status_code=~"5.."}[5m])) / sum by (service) (rate(http_request_duration_seconds_count{role="api",route=~"/api/v1/tasks.*"}[5m])) > 0.0144
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          {
+            summary: 'API 5xx rate exceeds 14.4x the 99.9% error budget; not a monthly availability measurement',
+          }
+      - alert: TaskQueueAcceptanceLatency
+        expr: task_queue:api_acceptance:p95_seconds > 0.5
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: 'Acceptance p95 above 500ms' }
+      - alert: TaskQueueDocumentLatency
+        expr: task_queue:document_completion:p95_seconds > 5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          { summary: 'Successful document completion p95 above 5s; also inspect failures/backlog' }
+      - alert: TaskQueueAuditEnqueueFailed
+        expr: increase(audit_delivery_total{outcome="enqueue_failed"}[5m]) > 0
+        labels: { severity: critical }
+        annotations:
+          { summary: 'Audit was not durably enqueued; recover logs/Redis audit and investigate' }
+      - alert: TaskQueueAuditBacklog
+        expr: audit_outbox_oldest_age_seconds > 300 or sum by (service) (audit_outbox_jobs{state="failed"}) > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          { summary: 'Audit archival backlog; age samples pending state heads, not exhaustive' }
+      - alert: TaskQueueMaintenanceStale
+        expr: time() - maintenance_last_success_timestamp_seconds > 120
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: 'DLQ/audit reconciliation has not completed recently' }
+      - alert: TaskQueueDlqNeedsReview
+        expr: queue_jobs{queue="tasks-dead-letter",state="waiting"} > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          {
+            summary: 'Terminal failures require operator triage; retained originals need managed cleanup',
+          }
+      - alert: TaskQueueBackupAtRisk
+        expr: time() - backup_last_verified_timestamp_seconds > 600 or up{job="task-queue-backup"} == 0 or absent(up{job="task-queue-backup"})
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          { summary: 'Verified off-host backup is approaching/exceeding the 15 minute RPO' }
+      - alert: TaskQueueBackupFailed
+        expr: increase(backup_failures_total[5m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: 'Backup capture/upload/remote verification failed' }

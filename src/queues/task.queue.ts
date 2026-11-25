@@ -18,9 +18,11 @@ export const taskQueue = new Queue<TaskJobData, TaskResult, TaskType>(TASK_QUEUE
       age: 24 * 60 * 60,
       count: 1_000,
     },
-    removeOnFail: {
-      age: 7 * 24 * 60 * 60,
-      count: 5_000,
-    },
+    removeOnFail: config.DLQ_RECONCILE_ENABLED
+      ? false
+      : {
+          age: 7 * 24 * 60 * 60,
+          count: 5_000,
+        },
   },
 });

@@ -3,6 +3,7 @@ import { config } from '../config/env.js';
 import { deadLetterQueue, readDeadLetterCounts } from '../queues/dead-letter.queue.js';
 import { taskQueue } from '../queues/task.queue.js';
 import type { CircuitState } from '../resilience/circuit-breaker.js';
+import { readTenantInflight } from '../queues/admission.js';
 
 export const metricsRegistry = new Registry();
 metricsRegistry.setDefaultLabels({ service: config.SERVICE_NAME, role: config.PROCESS_ROLE });
@@ -23,6 +24,25 @@ export const tasksEnqueuedTotal = new Counter({
   registers: [metricsRegistry],
 });
 
+export const backpressureRejections = new Counter({
+  name: 'task_backpressure_rejections_total',
+  help: 'Admission rejections by capacity limit',
+  labelNames: ['reason'] as const,
+  registers: [metricsRegistry],
+});
+
+new Gauge({
+  name: 'tenant_tasks_inflight',
+  help: 'Current waiting, active and delayed tasks per tenant from Redis',
+  labelNames: ['tenant'] as const,
+  registers: [metricsRegistry],
+  async collect() {
+    const counts = await readTenantInflight();
+    this.reset();
+    for (const [tenant, count] of counts) this.set({ tenant }, count);
+  },
+});
+
 export const tasksProcessedTotal = new Counter({
   name: 'tasks_processed_total',
   help: 'Task attempts finished by this worker, by outcome',
@@ -35,6 +55,42 @@ export const taskDuration = new Histogram({
   help: 'Duration of a single task attempt',
   labelNames: ['task_type', 'outcome'] as const,
   buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 3, 5, 10, 30],
+  registers: [metricsRegistry],
+});
+
+export const taskEndToEndDuration = new Histogram({
+  name: 'task_end_to_end_duration_seconds',
+  help: 'Time from job creation to terminal outcome, including queue wait and retries',
+  labelNames: ['task_type', 'outcome'] as const,
+  buckets: [0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 300],
+  registers: [metricsRegistry],
+});
+export const auditDeliveryTotal = new Counter({
+  name: 'audit_delivery_total',
+  help: 'Durable audit enqueue/delivery outcomes',
+  labelNames: ['outcome'] as const,
+  registers: [metricsRegistry],
+});
+export const auditOutboxJobs = new Gauge({
+  name: 'audit_outbox_jobs',
+  help: 'Last observed durable audit backlog by state',
+  labelNames: ['state'] as const,
+  registers: [metricsRegistry],
+});
+export const auditOutboxOldestAge = new Gauge({
+  name: 'audit_outbox_oldest_age_seconds',
+  help: 'Oldest observed head age across pending audit states (sample, not exhaustive)',
+  registers: [metricsRegistry],
+});
+export const dlqReconciledTotal = new Counter({
+  name: 'dlq_reconciled_total',
+  help: 'Missing DLQ entries recovered by this reconciler',
+  registers: [metricsRegistry],
+});
+export const maintenanceLastSuccess = new Gauge({
+  name: 'maintenance_last_success_timestamp_seconds',
+  help: 'Last successful maintenance pass',
+  labelNames: ['operation'] as const,
   registers: [metricsRegistry],
 });
 

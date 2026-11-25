@@ -1,0 +1,85 @@
+# Compose >= 2.24.4. External TLS proxy on the same host; no development profiles.
+services:
+  app:
+    image: ${APP_IMAGE:?Use an immutable approved application image}
+    build: !reset null
+    environment:
+      PROCESS_ROLE: api
+      PRODUCTION_HARDENING_ENABLED: 'true'
+      ADMIN_AUTH_MODE: oidc
+      TRUST_PROXY: '1'
+      CORS_ORIGINS: ${CORS_ORIGINS:?Set explicit HTTPS origins}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?Set HTTPS issuer}
+      OIDC_PUBLIC_ISSUER_URL: ${OIDC_PUBLIC_ISSUER_URL:?Set HTTPS public issuer}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:?Set HTTPS callback}
+      AUDIT_WORM_ENDPOINT: ${AUDIT_WORM_ENDPOINT:?Set off-host HTTPS archival endpoint}
+      AUDIT_WORM_DELIVERY: outbox
+      AUDIT_WORM_LOCK_MODE: COMPLIANCE
+      DLQ_RECONCILE_ENABLED: 'true'
+      SHUTDOWN_TIMEOUT_MS: '45000'
+    stop_grace_period: 60s
+    ports: !override ['127.0.0.1:${PORT:-3000}:3000']
+    read_only: true
+    tmpfs: ['/tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000']
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    logging: { driver: json-file, options: { max-size: 10m, max-file: '5' } }
+  worker:
+    profiles: !reset []
+    image: ${APP_IMAGE:?Use an immutable approved application image}
+    build: !reset null
+    environment:
+      PRODUCTION_HARDENING_ENABLED: 'true'
+      AUDIT_WORM_ENDPOINT: ${AUDIT_WORM_ENDPOINT:?Set off-host HTTPS archival endpoint}
+      AUDIT_WORM_DELIVERY: outbox
+      AUDIT_WORM_LOCK_MODE: COMPLIANCE
+      DLQ_RECONCILE_ENABLED: 'true'
+      SHUTDOWN_TIMEOUT_MS: '45000'
+    stop_grace_period: 60s
+    read_only: true
+    tmpfs: ['/tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000']
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    mem_limit: 1g
+    cpus: 2.0
+    pids_limit: 128
+    logging: { driver: json-file, options: { max-size: 10m, max-file: '5' } }
+  redis:
+    ports: !reset []
+    mem_limit: 2g
+    cpus: 1.0
+    pids_limit: 64
+    command:
+      - sh
+      - -c
+      - |
+        exec redis-server - --appendonly yes --appendfsync everysec --maxmemory 1400mb --maxmemory-policy noeviction <<EOF
+        requirepass $$REDIS_PASSWORD
+        masterauth $$REDIS_PASSWORD
+        replica-announce-ip $${REDIS_HA_NODE_IP:-redis}
+        replica-announce-port 6379
+        EOF
+  redis-sentinel-1:
+    ports: !reset []
+  redis-sentinel-2:
+    ports: !reset []
+  redis-sentinel-3:
+    ports: !reset []
+  backup:
+    profiles: !reset []
+    image: ${OPERATIONS_IMAGE:?Use an immutable approved operations image}
+    build: !reset null
+    environment:
+      PRODUCTION_HARDENING_ENABLED: 'true'
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 64
+    logging: { driver: json-file, options: { max-size: 10m, max-file: '5' } }
+  prometheus:
+    ports: !override ['127.0.0.1:${PROMETHEUS_PORT:-9090}:9090']
+    volumes:
+      - ./ops/prometheus/production.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/operational-rules.yml:/etc/prometheus/operational-rules.yml:ro

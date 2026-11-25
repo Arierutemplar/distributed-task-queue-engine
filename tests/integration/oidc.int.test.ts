@@ -94,6 +94,7 @@ describe('OIDC RBAC on real administrative routes', () => {
       ['delete', '/admin/api/dead-letter/viewer-job'],
       ['put', '/admin/queues/api/queues/tasks/pause'],
       ['patch', '/admin/unknown'],
+      ['post', '/admin/api/secrets/reload'],
     ] as const) {
       expect((await request(app)[method](path).auth(viewer, { type: 'bearer' })).status).toBe(403);
     }
@@ -101,12 +102,12 @@ describe('OIDC RBAC on real administrative routes', () => {
     expect(await taskQueue.getWaitingCount()).toBe(0);
     const records = await waitFor(async () => {
       const items = await audit.list(100);
-      return items.filter((event) => event.action === 'admin.access_denied').length === 4
+      return items.filter((event) => event.action === 'admin.access_denied').length === 5
         ? items
         : undefined;
     }, 'RBAC denials to be persisted');
     expect(records.filter((event) => event.action === 'admin.access_denied')).toEqual(
-      Array.from({ length: 4 }, () =>
+      Array.from({ length: 5 }, () =>
         expect.objectContaining({
           outcome: 'denied',
           actor: 'local-viewer',

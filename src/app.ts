@@ -27,6 +27,9 @@ import { metricsRegistry } from './observability/metrics.js';
 import { traceRequests } from './observability/tracing.js';
 import { IdempotencyConflictError } from './services/task.service.js';
 import { createHealthRouter, type ReadinessCheck } from './routes/health.routes.js';
+import { BackpressureError } from './queues/admission.js';
+import { backpressureRejections } from './observability/metrics.js';
+import type { SecretsReloader } from './config/secrets-reload.js';
 
 export interface AppOptions {
   config?: AppConfig;
@@ -35,6 +38,7 @@ export interface AppOptions {
   createRateLimitStore?: (prefix: string) => Store;
   /** Audit trail for admin actions; defaults to structured log lines only (no persistence). */
   auditLog?: AuditLog;
+  secretsReloader?: SecretsReloader;
 }
 
 const parseCorsOrigins = (value: string): cors.CorsOptions['origin'] =>
@@ -109,6 +113,10 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
     }),
   );
   app.use(httpMetrics);
+  app.use((_request, response, next) => {
+    response.locals.admissionLimits = settings;
+    next();
+  });
 
   app.use('/health', createHealthRouter(options.readinessChecks ?? []));
 
@@ -165,10 +173,10 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
       helmet(),
       cors({
         origin: parseCorsOrigins(settings.CORS_ORIGINS),
-        exposedHeaders: ['X-Request-Id', 'Location', 'Idempotent-Replayed'],
+        exposedHeaders: ['X-Request-Id', 'Location', 'Idempotent-Replayed', 'Retry-After'],
       }),
       apiLimiter,
-      apiKeyAuth(settings.API_KEYS),
+      options.secretsReloader?.authenticate ?? apiKeyAuth(settings.API_KEYS),
       tenantLimiter,
       express.json({ limit: '1mb' }),
       taskRouter,
@@ -214,6 +222,34 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
     });
     app.use('/admin', adminAuthLimiter);
     app.use('/admin', security.router, security.authenticate);
+    app.post('/admin/api/secrets/reload', async (request, response, next) => {
+      if (response.locals.adminRole !== 'admin') {
+        response.status(403).json({ error: 'Forbidden' });
+        return;
+      }
+      const event = {
+        action: 'admin.secrets_reload' as const,
+        actor: getAdminActor(response.locals),
+        ...getAdminIdentity(response.locals),
+        requestId: getRequestId(response.locals),
+        method: request.method,
+        path: '/admin/api/secrets/reload',
+        ip: request.ip,
+      };
+      if (!options.secretsReloader) {
+        await audit.record({ ...event, outcome: 'error', statusCode: 503 });
+        response.status(503).json({ error: 'Secrets reload is unavailable' });
+        return;
+      }
+      try {
+        await options.secretsReloader.reload();
+        await audit.record({ ...event, outcome: 'success', statusCode: 200 });
+        response.json({ status: 'reloaded' });
+      } catch (error: unknown) {
+        await audit.record({ ...event, outcome: 'error', statusCode: 500 });
+        next(error);
+      }
+    });
     app.get('/admin/api/audit', async (request, response, next) => {
       const limit = auditLimitSchema.safeParse(request.query.limit);
       if (!limit.success) {
@@ -283,6 +319,13 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
 
     if (error instanceof IdempotencyConflictError) {
       response.status(409).json({ error: error.message, requestId: requestIdValue });
+      return;
+    }
+
+    if (error instanceof BackpressureError) {
+      backpressureRejections.inc({ reason: error.reason });
+      response.setHeader('Retry-After', '1');
+      response.status(429).json({ error: error.message, requestId: requestIdValue });
       return;
     }
 

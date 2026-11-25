@@ -16,6 +16,9 @@
     "format:check": "prettier --check .",
     "build": "tsc --project tsconfig.json",
     "start": "node dist/src/index.js",
+    "ops:backup": "tsx src/operations/backup-cli.ts once",
+    "ops:restore-check": "tsx src/operations/backup-cli.ts restore-check",
+    "ops:reliability": "node ops/reliability/drill.js",
     "typecheck": "tsc --noEmit",
     "check": "npm run lint && npm run format:check && npm run typecheck && npm run test:coverage",
     "ci": "npm run check && npm run test:integration && npm run build"

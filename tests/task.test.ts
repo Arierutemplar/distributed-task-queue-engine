@@ -6,15 +6,18 @@ const mocks = vi.hoisted(() => ({
   add: vi.fn(),
   getJob: vi.fn(),
   deadLetterGetJob: vi.fn(),
+  eval: vi.fn(),
 }));
 
-vi.mock('../src/config/redis.js', () => ({ redis: {}, pingRedis: vi.fn() }));
+vi.mock('../src/config/redis.js', () => ({ redis: { eval: mocks.eval }, pingRedis: vi.fn() }));
 
 vi.mock('../src/queues/task.queue.js', () => ({
   TASK_QUEUE_NAME: 'tasks',
   TASK_MAX_ATTEMPTS: 5,
   taskQueue: {
     name: 'tasks',
+    toKey: (key: string) => `bull:tasks:${key}`,
+    defaultJobOptions: {},
     add: mocks.add,
     getJob: mocks.getJob,
     getJobCounts: vi.fn(async () => ({})),
@@ -43,6 +46,7 @@ import { loadConfig } from '../src/config/env.js';
 import { idempotentJobId, payloadFingerprint } from '../src/services/task.service.js';
 import { tenantIdForApiKey } from '../src/middleware/http.middleware.js';
 import { PUBLIC_TENANT_ID, type TaskPayload } from '../src/types/task.types.js';
+import { createSecretsReloader } from '../src/config/secrets-reload.js';
 
 const JOB_ID = 'job-123e4567-e89b-12d3-a456-426614174000';
 
@@ -85,6 +89,30 @@ describe('POST /api/v1/tasks/process', () => {
       expect.arrayContaining([
         expect.objectContaining({ path: 'documentId' }),
         expect.objectContaining({ path: 'content' }),
+      ]),
+    );
+    expect(mocks.add).not.toHaveBeenCalled();
+  });
+
+  it('accepts version 1 and rejects unsupported payload versions before enqueueing', async () => {
+    const accepted = await request(app)
+      .post('/api/v1/tasks/process')
+      .send({ ...documentPayload, schemaVersion: 1 });
+    expect(accepted.status).toBe(202);
+    expect(payloadFingerprint({ ...documentPayload, schemaVersion: 1 })).toBe(
+      payloadFingerprint(documentPayload),
+    );
+    mocks.add.mockClear();
+    const rejected = await request(app)
+      .post('/api/v1/tasks/process')
+      .send({ ...documentPayload, schemaVersion: 2 });
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: 'schemaVersion',
+          message: expect.stringMatching(/supported/iu),
+        }),
       ]),
     );
     expect(mocks.add).not.toHaveBeenCalled();
@@ -204,6 +232,22 @@ describe('POST /api/v1/tasks/process', () => {
       requestId: expect.any(String),
     });
   });
+
+  it.each(['queue', 'tenant'] as const)(
+    'returns 429 and Retry-After for %s backpressure',
+    async (reason) => {
+      mocks.eval.mockResolvedValue(reason);
+      const limitedApp = await createApp({
+        config: loadConfig({ NODE_ENV: 'test', QUEUE_MAX_WAITING: '1', TENANT_MAX_INFLIGHT: '1' }),
+      });
+      const response = await request(limitedApp)
+        .post('/api/v1/tasks/process')
+        .send(documentPayload);
+      expect(response.status).toBe(429);
+      expect(response.headers['retry-after']).toBe('1');
+      expect(response.body.error).toMatch(/capacity|quota/iu);
+    },
+  );
 });
 
 describe('GET /api/v1/tasks/:taskId', () => {
@@ -399,6 +443,7 @@ describe('API key authentication and tenant isolation', () => {
         RATE_LIMIT_TENANT_MAX: '1',
       }),
     });
+
     const send = (key: string) =>
       request(quotaApp).post('/api/v1/tasks/process').set('X-API-Key', key).send(documentPayload);
 
@@ -407,5 +452,48 @@ describe('API key authentication and tenant isolation', () => {
     expect(limited.status).toBe(429);
     expect(limited.body.error).toBe('Tenant request quota exceeded');
     expect((await send(KEY_B)).status).toBe(202);
+  });
+
+  it('reloads and revokes keys through the admin endpoint without opening the API', async () => {
+    const source = { API_KEYS: `acme:${KEY_A}` };
+    const reloader = createSecretsReloader(loadConfig(source).API_KEYS, source);
+    const audit = { record: vi.fn(async () => undefined), list: vi.fn(async () => []) };
+    const reloadApp = await createApp({
+      config: loadConfig({
+        NODE_ENV: 'test',
+        API_KEYS: source.API_KEYS,
+        ADMIN_PASSWORD: 'admin-password-123',
+      }),
+      secretsReloader: reloader,
+      auditLog: audit,
+    });
+    const submit = (key?: string) => {
+      const call = request(reloadApp).post('/api/v1/tasks/process');
+      if (key) call.set('X-API-Key', key);
+      return call.send(documentPayload);
+    };
+    const reload = () =>
+      request(reloadApp).post('/admin/api/secrets/reload').auth('admin', 'admin-password-123');
+    expect((await submit(KEY_A)).status).toBe(202);
+    expect((await request(reloadApp).post('/admin/api/secrets/reload')).status).toBe(401);
+    source.API_KEYS = `acme:${KEY_A},acme:${KEY_B}`;
+    expect((await reload()).status).toBe(200);
+    expect((await submit(KEY_B)).status).toBe(202);
+    source.API_KEYS = 'short';
+    expect((await reload()).status).toBe(500);
+    expect((await submit(KEY_A)).status).toBe(202);
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'admin.secrets_reload', outcome: 'error' }),
+    );
+    source.API_KEYS = `acme:${KEY_B}`;
+    expect((await reload()).status).toBe(200);
+    expect((await submit(KEY_A)).status).toBe(401);
+    source.API_KEYS = '';
+    expect((await reload()).status).toBe(200);
+    expect((await submit()).status).toBe(401);
+    expect((await submit(KEY_B)).status).toBe(401);
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'admin.secrets_reload', outcome: 'success' }),
+    );
   });
 });

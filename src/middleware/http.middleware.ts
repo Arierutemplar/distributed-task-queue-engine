@@ -53,14 +53,17 @@ export const getTenantId = (locals: Record<string, unknown>): string => {
  * is its own tenant. With no keys configured (development only; production config rejects
  * it) every caller shares PUBLIC_TENANT_ID.
  */
-export const apiKeyAuth = (apiKeys: readonly ApiKeyEntry[]): RequestHandler => {
+export const apiKeyAuth = (
+  apiKeys: readonly ApiKeyEntry[],
+  allowAnonymous = true,
+): RequestHandler => {
   const tenants = apiKeys.map(({ key, tenantId }) => ({
     digest: digest(key),
     tenantId: tenantId ?? tenantIdForApiKey(key),
   }));
 
   return (request, response, next) => {
-    if (tenants.length === 0) {
+    if (tenants.length === 0 && allowAnonymous) {
       response.locals.tenantId = PUBLIC_TENANT_ID;
       next();
       return;

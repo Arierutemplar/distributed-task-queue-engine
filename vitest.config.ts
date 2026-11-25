@@ -13,6 +13,9 @@ export default defineConfig({
       LOG_LEVEL: 'silent',
       ADMIN_AUTH_MODE: 'basic',
       AUDIT_WORM_ENABLED: 'false',
+      AUDIT_WORM_DELIVERY: 'direct',
+      DLQ_RECONCILE_ENABLED: 'false',
+      PRODUCTION_HARDENING_ENABLED: 'false',
       SECRETS_PROVIDER: 'env',
       REDIS_SENTINEL_HOSTS: '',
       REDIS_SENTINEL_MASTER_NAME: '',
@@ -21,7 +24,7 @@ export default defineConfig({
       provider: 'v8',
       include: ['src/**/*.ts'],
       // Process entry point: wiring only, exercised by the integration and Docker smoke tests.
-      exclude: ['src/index.ts', 'src/runtime.ts'],
+      exclude: ['src/index.ts', 'src/runtime.ts', 'src/operations/backup-cli.ts'],
       reporter: ['text-summary', 'text', 'html', 'lcov', 'json-summary'],
       reportsDirectory: 'coverage',
       // Ratchet these up as coverage grows; CI fails below them.

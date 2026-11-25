@@ -1,0 +1,28 @@
+name: Operational reliability drills
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 4 * * 1'
+jobs:
+  reliability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Load, archive outage/restart, lost callback, Sentinel failover and encrypted restore
+        run: npm run ops:reliability
+        env:
+          RELIABILITY_REPORT: reliability-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reliability-report
+          path: reliability-report.json
+          if-no-files-found: warn

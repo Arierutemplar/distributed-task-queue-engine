@@ -5,6 +5,8 @@ import type { AuditEvent, AuditLog } from '../observability/audit.js';
 import { deadLetterJobId, deadLetterQueue } from '../queues/dead-letter.queue.js';
 import { dispatchTask } from '../services/task.service.js';
 import { PUBLIC_TENANT_ID, taskIdSchema, taskPayloadSchema } from '../types/task.types.js';
+import type { AdmissionLimits } from '../queues/admission.js';
+import { BackpressureError } from '../queues/admission.js';
 
 const paginationSchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
@@ -114,6 +116,7 @@ export const createDeadLetterRouter = (audit: AuditLog): Router => {
         requestId: getRequestId(response.locals),
         tenantId,
         replayOf: taskId,
+        limits: response.locals.admissionLimits as AdmissionLimits | undefined,
       });
       await entry.remove();
       await recordAudit(request, response, {
@@ -129,7 +132,7 @@ export const createDeadLetterRouter = (audit: AuditLog): Router => {
       await recordAudit(request, response, {
         action,
         outcome: 'error',
-        statusCode: 500,
+        statusCode: error instanceof BackpressureError ? 429 : 500,
         taskId,
         reason: error instanceof Error ? error.message : 'unknown error',
       });

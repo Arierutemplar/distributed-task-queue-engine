@@ -18,11 +18,22 @@ export interface AuditWormOptions {
   now?: () => Date;
 }
 
+export class AuditArchiveError extends Error {
+  constructor(readonly errorType: string) {
+    super(`WORM delivery failed: ${errorType}`);
+    this.name = 'AuditArchiveError';
+  }
+}
+
+export interface AuditWormSink extends AuditSink {
+  deliver: (record: AuditRecord) => Promise<void>;
+}
+
 export const createAuditWormSink = (
   settings: AppConfig,
   logger: Logger,
   options: AuditWormOptions = {},
-): AuditSink | undefined => {
+): AuditWormSink | undefined => {
   if (!settings.AUDIT_WORM_ENABLED) return undefined;
   const log = logger.child({ auditWorm: true });
   if (!settings.AUDIT_WORM_ACCESS_KEY_ID || !settings.AUDIT_WORM_SECRET_ACCESS_KEY) {
@@ -47,7 +58,7 @@ export const createAuditWormSink = (
 
   const archive = async (record: AuditRecord): Promise<void> => {
     const bucket = settings.AUDIT_WORM_BUCKET;
-    const key = `${encodeURIComponent(settings.SERVICE_NAME)}/${record.timestamp.slice(0, 10)}/${randomUUID()}.json`;
+    const key = `${encodeURIComponent(settings.SERVICE_NAME)}/${record.timestamp.slice(0, 10)}/${record.archiveId ?? randomUUID()}.json`;
     try {
       const body = JSON.stringify(record);
       const retainUntil = new Date(
@@ -103,24 +114,35 @@ export const createAuditWormSink = (
         ? name
         : 'ArchiveError';
       log.error({ bucket, key, errorType }, 'WORM audit write failed; Redis/log audit is retained');
+      throw new AuditArchiveError(errorType);
     }
   };
 
+  const deliver = (record: AuditRecord): Promise<void> => {
+    if (closed) {
+      log.error('WORM archive is closed; record remains in Redis/logs only');
+      return Promise.reject(new AuditArchiveError('ArchiveClosed'));
+    }
+    const operation = archive(record);
+    pending.add(operation);
+    return operation.finally(() => {
+      pending.delete(operation);
+    });
+  };
+
   return {
-    write(record) {
-      if (closed) {
-        log.error('WORM archive is closed; record remains in Redis/logs only');
-        return Promise.resolve();
+    deliver,
+    async write(record) {
+      try {
+        await deliver(record);
+      } catch (error: unknown) {
+        if (!(error instanceof AuditArchiveError)) throw error;
+        // Direct mode keeps its historical best-effort API behavior.
       }
-      const operation = archive(record);
-      pending.add(operation);
-      return operation.finally(() => {
-        pending.delete(operation);
-      });
     },
     async close() {
       closed = true;
-      await Promise.all(pending);
+      await Promise.allSettled(pending);
       client.destroy();
     },
   };

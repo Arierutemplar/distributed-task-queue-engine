@@ -13,6 +13,20 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
+FROM redis:7-alpine AS redis-tools
+
+FROM node:22-alpine AS operations
+ENV NODE_ENV=production
+WORKDIR /app
+RUN apk add --no-cache openssl libgcc libstdc++ && mkdir -p /app/fixture-data && chown node:node /app/fixture-data
+COPY --from=redis-tools /usr/local/bin/redis-server /usr/local/bin/redis-cli /usr/local/bin/redis-check-rdb /usr/local/bin/
+COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/dist ./dist
+COPY --chown=node:node package.json ./
+COPY --chown=node:node ops/reliability ./ops/reliability
+USER node
+CMD ["node", "dist/src/operations/backup-cli.js", "agent"]
+
 FROM node:22-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app

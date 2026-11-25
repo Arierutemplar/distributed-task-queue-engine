@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { readFile } from 'node:fs/promises';
 import { withTimeout } from '../resilience/timeout.js';
 
 const optional = z.preprocess(
@@ -21,6 +22,7 @@ const vaultSchema = z
     VAULT_SECRET_PATH: z.string().refine((path) => safePath(path) && path.includes('/data/')),
     VAULT_NAMESPACE: optional,
     VAULT_TIMEOUT_MS: z.coerce.number().int().min(100).max(60_000).default(5_000),
+    PRODUCTION_HARDENING_ENABLED: z.enum(['true', 'false']).default('false'),
   })
   .superRefine((settings, context) => {
     const url = new URL(settings.VAULT_ADDR);
@@ -31,7 +33,7 @@ const vaultSchema = z
       url.password ||
       url.search ||
       url.hash ||
-      (url.protocol !== 'https:' && !local)
+      (url.protocol !== 'https:' && (!local || settings.PRODUCTION_HARDENING_ENABLED === 'true'))
     ) {
       context.addIssue({
         code: 'custom',
@@ -68,6 +70,9 @@ const sensitiveKeys = new Set([
   'SESSION_SECRET',
   'AUDIT_WORM_ACCESS_KEY_ID',
   'AUDIT_WORM_SECRET_ACCESS_KEY',
+  'BACKUP_S3_ACCESS_KEY_ID',
+  'BACKUP_S3_SECRET_ACCESS_KEY',
+  'BACKUP_ENCRYPTION_KEY',
 ]);
 
 export class SecretsProviderError extends Error {
@@ -82,7 +87,17 @@ export const loadSecrets = async (
   source: NodeJS.ProcessEnv = process.env,
 ): Promise<{ provider: 'env' | 'vault'; keys: string[] }> => {
   const provider = source.SECRETS_PROVIDER?.trim() ?? 'env';
-  if (provider === 'env' || provider === '') return { provider: 'env', keys: [] };
+  if (provider === 'env' || provider === '') {
+    if (source.API_KEYS_FILE) {
+      try {
+        source.API_KEYS = (await readFile(source.API_KEYS_FILE, 'utf8')).trim();
+      } catch {
+        throw new SecretsProviderError('Unable to read API_KEYS_FILE');
+      }
+      return { provider: 'env', keys: ['API_KEYS'] };
+    }
+    return { provider: 'env', keys: [] };
+  }
   if (provider !== 'vault') throw new SecretsProviderError('SECRETS_PROVIDER must be env or vault');
   const parsed = vaultSchema.safeParse(source);
   if (!parsed.success) {
@@ -141,7 +156,7 @@ export const loadSecrets = async (
   const loaded: Record<string, string> = {};
   for (const [key, value] of Object.entries(secret.data.data.data)) {
     if (!sensitiveKeys.has(key)) continue;
-    if (typeof value !== 'string' || !value.trim()) {
+    if (typeof value !== 'string' || (key !== 'API_KEYS' && !value.trim())) {
       throw new SecretsProviderError(`Vault sensitive key ${key} must be a nonempty string`);
     }
     loaded[key] = value;

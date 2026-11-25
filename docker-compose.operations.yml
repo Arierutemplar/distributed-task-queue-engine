@@ -1,0 +1,60 @@
+services:
+  backup:
+    profiles: ['operations']
+    build:
+      context: .
+      target: operations
+    image: ${OPERATIONS_IMAGE:-distributed-task-queue-operations:local}
+    environment:
+      SERVICE_NAME: ${SERVICE_NAME:-distributed-task-queue}
+      SECRETS_PROVIDER: ${BACKUP_SECRETS_PROVIDER:-env}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_AUTH_METHOD: ${BACKUP_VAULT_AUTH_METHOD:-token}
+      VAULT_TOKEN: ${BACKUP_VAULT_TOKEN:-}
+      VAULT_ROLE_ID: ${BACKUP_VAULT_ROLE_ID:-}
+      VAULT_SECRET_ID: ${BACKUP_VAULT_SECRET_ID:-}
+      VAULT_SECRET_PATH: ${BACKUP_VAULT_SECRET_PATH:-secret/data/task-queue-backup}
+      VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      REDIS_SENTINEL_HOSTS: ${REDIS_SENTINEL_HOSTS:-}
+      REDIS_SENTINEL_MASTER_NAME: ${REDIS_SENTINEL_MASTER_NAME:-}
+      REDIS_SENTINEL_USERNAME: ${REDIS_SENTINEL_USERNAME:-}
+      REDIS_SENTINEL_PASSWORD: ${REDIS_SENTINEL_PASSWORD:-}
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
+      BACKUP_S3_REGION: ${BACKUP_S3_REGION:-us-east-1}
+      BACKUP_S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID:-}
+      BACKUP_S3_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_ACCESS_KEY:-}
+      BACKUP_ENCRYPTION_KEY: ${BACKUP_ENCRYPTION_KEY:-}
+      BACKUP_KEY_ID: ${BACKUP_KEY_ID:-v1}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-90}
+      BACKUP_INTERVAL_MS: ${BACKUP_INTERVAL_MS:-300000}
+      BACKUP_TIMEOUT_MS: ${BACKUP_TIMEOUT_MS:-240000}
+      BACKUP_MAX_BYTES: ${BACKUP_MAX_BYTES:-1073741824}
+      BACKUP_RPO_SECONDS: ${BACKUP_RPO_SECONDS:-900}
+      BACKUP_RTO_SECONDS: ${BACKUP_RTO_SECONDS:-900}
+      PRODUCTION_HARDENING_ENABLED: ${PRODUCTION_HARDENING_ENABLED:-false}
+    networks: [queue-net]
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs: ['/tmp:rw,noexec,nosuid,size=3g,uid=1000,gid=1000,mode=0700']
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    init: true
+    stop_grace_period: 260s
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3100/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 240s
+      retries: 3

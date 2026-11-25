@@ -2,13 +2,15 @@ import './config/dotenv.js';
 import { loadSecrets, SecretsProviderError } from './config/secrets.js';
 
 try {
+  const initialEnvironment = { ...process.env };
   const loaded = await loadSecrets();
   await import('./config/env.js');
   const { logger } = await import('./config/logger.js');
   if (loaded.provider === 'vault') {
     logger.info({ provider: loaded.provider, keys: loaded.keys }, 'Runtime secrets loaded');
   }
-  await import('./runtime.js');
+  const { startRuntime } = await import('./runtime.js');
+  startRuntime(initialEnvironment);
 } catch (error: unknown) {
   const detail =
     error instanceof SecretsProviderError ||

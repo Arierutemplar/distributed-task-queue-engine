@@ -3,7 +3,12 @@ import { SpanKind, trace } from '@opentelemetry/api';
 import { config } from '../config/env.js';
 import { logger } from '../config/logger.js';
 import { coordinationRedis, redis } from '../config/redis.js';
-import { taskDuration, tasksProcessedTotal, setCircuitState } from '../observability/metrics.js';
+import {
+  taskDuration,
+  taskEndToEndDuration,
+  tasksProcessedTotal,
+  setCircuitState,
+} from '../observability/metrics.js';
 import { jobAttemptContext, withJobSpan, withTraceContext } from '../observability/tracing.js';
 import { addDeadLetter } from '../queues/dead-letter.queue.js';
 import { TASK_QUEUE_NAME } from '../queues/task.queue.js';
@@ -106,6 +111,10 @@ export const createTaskWorker = (
   });
 
   worker.on('completed', (job, result) => {
+    taskEndToEndDuration.observe(
+      { task_type: job.name, outcome: 'completed' },
+      Math.max(0, ((job.finishedOn ?? Date.now()) - job.timestamp) / 1_000),
+    );
     const seconds = attemptSeconds(job);
     tasksProcessedTotal.inc({ task_type: job.name, outcome: 'completed' });
     if (seconds !== undefined) {
@@ -133,6 +142,12 @@ export const createTaskWorker = (
       return;
     }
     const seconds = attemptSeconds(job);
+    if (job.finishedOn !== undefined) {
+      taskEndToEndDuration.observe(
+        { task_type: job.name, outcome: 'failed' },
+        Math.max(0, (job.finishedOn - job.timestamp) / 1_000),
+      );
+    }
     tasksProcessedTotal.inc({ task_type: job.name, outcome: 'failed' });
     if (seconds !== undefined) {
       taskDuration.observe({ task_type: job.name, outcome: 'failed' }, seconds);

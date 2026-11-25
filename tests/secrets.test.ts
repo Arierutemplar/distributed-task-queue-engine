@@ -1,5 +1,8 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { mkdtemp, rmdir, unlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { loadSecrets } from '../src/config/secrets.js';
 
@@ -67,6 +70,24 @@ const environment = (overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
 });
 
 describe('Vault/OpenBao KV v2 secret loading', () => {
+  it('loads API keys from an explicitly configured file without touching dotenv', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dtq-key-test-'));
+    const file = join(directory, 'keys');
+    try {
+      const env: NodeJS.ProcessEnv = { API_KEYS_FILE: file, API_KEYS: 'old' };
+      await expect(loadSecrets(env)).rejects.toThrow('Unable to read API_KEYS_FILE');
+      expect(env.API_KEYS).toBe('old');
+      await writeFile(file, `acme:${'k'.repeat(32)}\n`);
+      expect(await loadSecrets(env)).toEqual({ provider: 'env', keys: ['API_KEYS'] });
+      expect(env.API_KEYS).toBe(`acme:${'k'.repeat(32)}`);
+      await writeFile(file, '');
+      await loadSecrets(env);
+      expect(env.API_KEYS).toBe('');
+    } finally {
+      await unlink(file);
+      await rmdir(directory);
+    }
+  });
   it('does nothing by default, even when unused Vault settings are invalid', async () => {
     const env = { ADMIN_PASSWORD: 'original', VAULT_ADDR: 'not-a-url' };
     expect(await loadSecrets(env)).toEqual({ provider: 'env', keys: [] });
