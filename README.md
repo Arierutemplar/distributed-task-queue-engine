@@ -881,6 +881,36 @@ node ops\reliability\external-probe.js http://127.0.0.1:3000
 npm run ops:reliability
 ```
 
+To run a reproducible host-side stress sample against an already running stack:
+
+```powershell
+$env:LOAD_URL = 'http://127.0.0.1:3000'
+$env:LOAD_API_KEY = 'your-32-character-api-key'
+$env:LOAD_RATE = '20'
+$env:LOAD_SECONDS = '30'
+$env:LOAD_MAX_INFLIGHT = '128'
+npm run ops:load
+Remove-Item Env:LOAD_URL,Env:LOAD_API_KEY,Env:LOAD_RATE,Env:LOAD_SECONDS,Env:LOAD_MAX_INFLIGHT
+```
+
+The JSON report includes requested/completed/error counts, HTTP status counts,
+throughput and p50/p95/p99 acceptance/completion latency. It is a representative
+test, not a production capacity certificate; repeat with production payloads,
+concurrency and infrastructure sizing.
+
+For local observability and base alert routing:
+
+```powershell
+docker compose --profile observability up -d prometheus alertmanager
+curl.exe --fail http://127.0.0.1:9093/-/ready
+```
+
+Alertmanager labels route platform and security alerts to named receiver sections
+defined in [ops/alertmanager/alertmanager.yml](ops/alertmanager/alertmanager.yml).
+The repository configuration is delivery-ready structurally but does not contain
+real PagerDuty, Opsgenie, email or webhook credentials; configure those external
+integrations before production.
+
 The probe reports per-endpoint latency and exits nonzero on failures; run it
 from an independent machine against HTTPS for real external monitoring. The
 restore exercise checks sampled completed, failed, waiting and delayed jobs,

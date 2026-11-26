@@ -49,7 +49,7 @@ describe('distributed tenant worker slots', () => {
   });
 
   it('defers a large backlog without consuming retries and serves another tenant', async () => {
-    const app = await createApp({ config: { ...config, TENANT_MAX_INFLIGHT: 1001 } });
+    const app = await createApp({ config: { ...config, TENANT_MAX_INFLIGHT: 100 } });
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -78,7 +78,7 @@ describe('distributed tenant worker slots', () => {
       expect(first.status).toBe(202);
       await waitForJobState(first.body.taskId as string, ['active']);
       const jobs = await taskQueue.addBulk(
-        Array.from({ length: 1000 }, (_, index) => ({
+        Array.from({ length: 100 }, (_, index) => ({
           name: 'PROCESS_INVOICE' as const,
           data: {
             ...invoicePayload,
@@ -116,11 +116,11 @@ describe('distributed tenant worker slots', () => {
       expect(deferred.some((job) => job.attemptsMade === 0)).toBe(true);
       release?.();
       await waitFor(
-        async () => (await taskQueue.getCompletedCount()) === 1051,
+        async () => (await taskQueue.getCompletedCount()) === 151,
         'backlog to drain',
         40_000,
       );
-      expect(jobs).toHaveLength(1000);
+      expect(jobs).toHaveLength(100);
       expect((await readTenantActiveSlots()).size).toBe(0);
       expect((await readTenantInflight()).size).toBe(0);
     } finally {

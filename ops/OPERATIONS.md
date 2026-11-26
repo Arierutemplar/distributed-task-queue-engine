@@ -113,6 +113,15 @@ Freshness alone is not proof that a production restore or off-host storage works
   Compare the Redis stream and structured logs with `audit_delivery_total`, outbox
   backlog/age and actual immutable objects; reconcile gaps and unresolved intents.
   Direct WORM export has no retry; outbox retries only after successful enqueue.
+- Reconciliation is a recovery aid, not a transaction or completeness guarantee.
+  A write is considered durable only after the corresponding durable Redis audit
+  stream entry or structured-log evidence exists, and WORM delivery is separate.
+  Preserve `operationId`, request ID and task/job IDs; verify mutation state,
+  then WORM object versions; never infer success from process exit or HTTP intent.
+  Pending intents survive process loss; unresolved `pending` records require
+  manual incident triage and must not be retried blindly. Redis stream trimming,
+  host loss and log retention can permanently remove evidence, so production
+  requires independent log/SIEM retention and off-host immutable archive review.
 - Automated security/audit checks (the integration suite **flushes** its Redis DB):
 
   ```powershell
@@ -473,9 +482,51 @@ the fixture. Use the real off-host bucket procedure above for production evidenc
 Set `RELIABILITY_REPORT` to save the JSON report and `RELIABILITY_LOAD_SECONDS` to
 increase the sustained run (5..300). Logs/errors are not a substitute for passed gates.
 
+For a standalone host-side load measurement against an already running stack:
+
+```powershell
+$env:LOAD_URL = 'http://127.0.0.1:3000'
+$env:LOAD_API_KEY = 'your-32-character-api-key'
+$env:LOAD_RATE = '20'
+$env:LOAD_SECONDS = '30'
+$env:LOAD_MAX_INFLIGHT = '128'
+npm run ops:load
+Remove-Item Env:LOAD_URL,Env:LOAD_API_KEY,Env:LOAD_RATE,Env:LOAD_SECONDS,Env:LOAD_MAX_INFLIGHT
+```
+
+The report records requested/completed/error counts, HTTP status counts, throughput,
+p50/p95/p99 acceptance and document-completion latency. It exits nonzero if a request
+fails, completion is incomplete, acceptance p95 exceeds 500ms or completion p95 exceeds
+5 seconds. Tune infrastructure and repeat with production payload distributions;
+this sample workload is not a capacity or availability certification.
+
 Run a real off-host restore drill monthly and after Redis/image/storage/key changes.
 Inject a representative dataset large enough to challenge RPO/RTO. Test a complete
 host outage, detection and proxy cutover separately; the single-host fixture cannot.
+
+## Alert delivery
+
+The observability profile includes Prometheus and a base Alertmanager configuration:
+
+```powershell
+docker compose --profile observability up -d prometheus alertmanager
+curl.exe --fail http://127.0.0.1:9093/-/ready
+```
+
+Prometheus routes alerts to `alertmanager:9093` in both the local and production
+configuration. The repository routes `team=security` alerts to `security-oncall`,
+`team=platform` alerts to `platform-oncall`, and unmatched alerts to `default-oncall`.
+`severity`, `owner`, `team` and `runbook_url` remain attached to every operational
+rule. The base receivers intentionally have no external integration; this prevents
+the fixture from pretending to page a real team.
+
+Before production, replace or extend the receiver sections in
+`ops/alertmanager/alertmanager.yml` with approved PagerDuty, Opsgenie, webhook,
+email or chat integrations. Verify routing with `amtool`, send a test alert and
+confirm acknowledgement, escalation and repeat intervals. Assign real primary and
+secondary people to the `platform-oncall`, `security-oncall` and `default-oncall`
+identifiers. Alert delivery is environment infrastructure; the repository supplies
+routing, labels and runbook URLs but cannot provision real credentials.
 
 ## Production Compose and rollout/rollback
 

@@ -47,10 +47,33 @@ export const resetState = async (): Promise<void> => {
 };
 
 export const closeConnections = async (): Promise<void> => {
-  await taskQueue.close();
-  await deadLetterQueue.close();
-  await coordinationRedis.quit();
-  await redis.quit();
+  const closeWithin = async (name: string, operation: () => Promise<unknown>): Promise<void> => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        operation(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Timed out closing ${name}; forcing disconnect`));
+          }, 5_000);
+        }),
+      ]);
+    } catch {
+      // Test cleanup must remain deterministic if a peer/client was already killed.
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  await closeWithin('task queue', () => taskQueue.close());
+  await closeWithin('dead-letter queue', () => deadLetterQueue.close());
+  await closeWithin('Redis coordination connection', async () => {
+    if (coordinationRedis.status !== 'end') await coordinationRedis.quit();
+  });
+  await closeWithin('Redis connection', async () => {
+    if (redis.status !== 'end') await redis.quit();
+  });
+  coordinationRedis.disconnect();
+  redis.disconnect();
 };
 
 export const waitFor = async <T>(

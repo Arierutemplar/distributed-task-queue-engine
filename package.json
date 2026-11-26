@@ -8,6 +8,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "ops:load": "node ops/reliability/load.js",
     "redis:test:up": "docker run -d --rm --name dtq-test-redis -p 127.0.0.1:6380:6379 redis:7-alpine",
     "redis:test:down": "docker rm -f dtq-test-redis",
     "lint": "eslint .",

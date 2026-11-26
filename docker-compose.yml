@@ -338,6 +338,24 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  alertmanager:
+    profiles: ['observability']
+    image: prom/alertmanager:v0.27.0
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    volumes:
+      - ./ops/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - '127.0.0.1:${ALERTMANAGER_PORT:-9093}:9093'
+    networks:
+      - queue-net
+    depends_on:
+      prometheus:
+        condition: service_started
+    restart: unless-stopped
+
   otel-collector:
     profiles: ['observability']
     image: otel/opentelemetry-collector:0.116.1
@@ -389,6 +407,7 @@ networks:
 
 volumes:
   redis_data:
+  alertmanager_data:
   minio_data:
   redis_replica_data:
   sentinel_1_data:

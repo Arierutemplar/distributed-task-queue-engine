@@ -14,9 +14,12 @@ export default defineConfig({
     environment: 'node',
     include: ['tests/integration/**/*.test.ts'],
     globalSetup: ['tests/integration/global-setup.ts'],
+    pool: 'forks',
+    maxWorkers: 1,
     fileParallelism: false,
     testTimeout: 30_000,
     hookTimeout: 30_000,
+    teardownTimeout: 10_000,
     clearMocks: true,
     env: {
       NODE_ENV: 'test',

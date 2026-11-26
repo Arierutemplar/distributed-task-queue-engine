@@ -18,6 +18,7 @@ const acceptance = [];
 const completion = [];
 const outstanding = new Set();
 const errors = [];
+const statusCounts = new Map();
 let verifiedTaskId;
 const content = 'reproducible document '.repeat(50);
 const sha256 = createHash('sha256').update(content).digest('hex');
@@ -29,6 +30,7 @@ const run = async () => {
     body: JSON.stringify({ type: 'PROCESS_DOCUMENT', documentId: randomUUID(), content }),
     signal: AbortSignal.timeout(15000),
   });
+  statusCounts.set(response.status, (statusCounts.get(response.status) ?? 0) + 1);
   if (response.status !== 202) throw new Error(`Acceptance status ${response.status}`);
   acceptance.push(performance.now() - started);
   const { taskId } = await response.json();
@@ -37,6 +39,7 @@ const run = async () => {
       headers,
       signal: AbortSignal.timeout(15000),
     });
+    statusCounts.set(status.status, (statusCounts.get(status.status) ?? 0) + 1);
     if (!status.ok) throw new Error(`Status response ${status.status}`);
     const task = await status.json();
     // State and result are separate Redis reads; completion can become visible between them.
@@ -69,6 +72,11 @@ for (let index = 0; index < total; index += 1) {
 await Promise.all(outstanding);
 const p95 = (values) =>
   values.length ? values.sort((a, b) => a - b)[Math.ceil(values.length * 0.95) - 1] : null;
+const percentile = (values, ratio) =>
+  values.length
+    ? [...values].sort((a, b) => a - b)[Math.max(0, Math.ceil(values.length * ratio) - 1)]
+    : null;
+const elapsedSeconds = (performance.now() - started) / 1000;
 const report = {
   kind: 'load-report',
   workload: 'PROCESS_DOCUMENT, 1100 ASCII bytes, open-loop arrival',
@@ -79,6 +87,14 @@ const report = {
   completed: completion.length,
   acceptanceP95Ms: p95(acceptance),
   documentP95Ms: p95(completion),
+  acceptanceP50Ms: percentile(acceptance, 0.5),
+  acceptanceP99Ms: percentile(acceptance, 0.99),
+  documentP50Ms: percentile(completion, 0.5),
+  documentP99Ms: percentile(completion, 0.99),
+  completedPerSecond:
+    elapsedSeconds > 0 ? Number((completion.length / elapsedSeconds).toFixed(3)) : 0,
+  errorCount: errors.length,
+  httpStatusCounts: Object.fromEntries([...statusCounts].sort(([a], [b]) => a - b)),
   errors,
   verifiedTaskId,
 };

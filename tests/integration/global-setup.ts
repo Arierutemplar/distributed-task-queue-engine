@@ -39,9 +39,20 @@ export default async function setup(): Promise<() => Promise<void>> {
   // A fresh connection: tests deliberately kill Redis clients (CLIENT KILL).
   return async () => {
     const cleanup = new Redis(TEST_REDIS_URL, { maxRetriesPerRequest: 1 });
+    let timer: NodeJS.Timeout | undefined;
     try {
-      await cleanup.flushdb();
+      await Promise.race([
+        cleanup.flushdb(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error('Redis integration cleanup timed out'));
+          }, 5_000);
+        }),
+      ]);
+    } catch {
+      // Teardown must never leave Vitest waiting on a stuck Redis command.
     } finally {
+      if (timer) clearTimeout(timer);
       cleanup.disconnect();
     }
   };
