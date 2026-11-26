@@ -214,7 +214,31 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
         ip: request.ip,
         statusCode: 403,
       });
-    const security = createAdminSecurity(settings, auditForbidden);
+    let security = createAdminSecurity(settings, auditForbidden);
+    let securitySettings = settings;
+    options.secretsReloader?.register((candidate, changed) => {
+      const applied = changed.filter(
+        (key) =>
+          key === 'ADMIN_PASSWORD' || key === 'OIDC_CLIENT_SECRET' || key === 'SESSION_SECRET',
+      );
+      if (applied.length === 0) return { applied, commit: () => undefined };
+      const updated = {
+        ...securitySettings,
+        ...(applied.includes('ADMIN_PASSWORD') ? { ADMIN_PASSWORD: candidate.ADMIN_PASSWORD } : {}),
+        ...(applied.includes('OIDC_CLIENT_SECRET')
+          ? { OIDC_CLIENT_SECRET: candidate.OIDC_CLIENT_SECRET }
+          : {}),
+        ...(applied.includes('SESSION_SECRET') ? { SESSION_SECRET: candidate.SESSION_SECRET } : {}),
+      };
+      const replacement = createAdminSecurity(updated, auditForbidden);
+      return {
+        applied,
+        commit: () => {
+          securitySettings = updated;
+          security = replacement;
+        },
+      };
+    });
     app.use('/admin', (request, response, next) => {
       response.once('finish', () => {
         const action = adminAccessAction(
@@ -257,7 +281,16 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
       next();
     });
     app.use('/admin', adminAuthLimiter);
-    app.use('/admin', security.router, security.authenticate);
+    app.use('/admin', (request, response, next) => {
+      const current = security;
+      current.router(request, response, (error?: unknown) => {
+        if (error) {
+          next(error);
+          return;
+        }
+        current.authenticate(request, response, next);
+      });
+    });
     app.post(
       '/admin/api/secrets/reload',
       asyncHandler(async (request, response, next) => {
@@ -281,16 +314,17 @@ export const createApp = async (options: AppOptions = {}): Promise<Express> => {
           response.status(503).json({ error: 'Secrets reload is unavailable' });
           return;
         }
+        let result;
         try {
           await audit.record({ ...event, outcome: 'pending' }, { requirePersistence: true });
-          await options.secretsReloader.reload();
+          result = await options.secretsReloader.reload();
         } catch (error: unknown) {
           await audit.record({ ...event, outcome: 'error', statusCode: 500 });
           next(error);
           return;
         }
         await audit.record({ ...event, outcome: 'success', statusCode: 200 });
-        response.json({ status: 'reloaded' });
+        response.json({ status: 'reloaded', ...result });
       }),
     );
     app.get('/admin/api/audit', async (request, response, next) => {

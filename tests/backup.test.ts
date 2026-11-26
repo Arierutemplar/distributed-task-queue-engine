@@ -12,15 +12,19 @@ import {
   downloadSnapshot,
   encryptSnapshot,
   loadBackupSettings,
+  rotateBackupStorage,
   type BackupStorage,
 } from '../src/operations/backup.js';
 
-const sdk = vi.hoisted(() => ({ send: vi.fn(), destroy: vi.fn() }));
+const sdk = vi.hoisted(() => ({ send: vi.fn(), destroy: vi.fn(), construct: vi.fn() }));
 vi.mock('@aws-sdk/client-s3', async (original) => {
   const module = await original<typeof S3>();
   return {
     ...module,
     S3Client: class {
+      constructor(config: unknown) {
+        sdk.construct(config);
+      }
       send = sdk.send;
       destroy = sdk.destroy;
     },
@@ -57,6 +61,41 @@ afterEach(async () => {
 });
 
 describe('verified encrypted backups', () => {
+  it('replaces backup storage only when its S3 credentials change', async () => {
+    const f = await fixture();
+    const original = {
+      ...f.settings,
+      BACKUP_S3_ACCESS_KEY_ID: 'old-access',
+      BACKUP_S3_SECRET_ACCESS_KEY: 'old-secret',
+    };
+    const storage = createBackupStorage(original);
+    const same = rotateBackupStorage(original, storage, original);
+    expect(same.changed).toBe(false);
+    expect(sdk.destroy).not.toHaveBeenCalled();
+    const rotated = rotateBackupStorage(original, storage, {
+      ...original,
+      BACKUP_S3_ACCESS_KEY_ID: 'new-access',
+      BACKUP_S3_SECRET_ACCESS_KEY: 'new-secret',
+    });
+    expect(rotated.changed).toBe(true);
+    expect(sdk.destroy).toHaveBeenCalledOnce();
+    expect(sdk.construct).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        credentials: { accessKeyId: 'new-access', secretAccessKey: 'new-secret' },
+      }),
+    );
+    expect(rotated.settings.BACKUP_ENCRYPTION_KEY).toBe(original.BACKUP_ENCRYPTION_KEY);
+    const endpointRotated = rotateBackupStorage(rotated.settings, rotated.storage, {
+      ...rotated.settings,
+      BACKUP_S3_ENDPOINT: 'http://127.0.0.1:9001',
+    });
+    expect(endpointRotated.changed).toBe(true);
+    expect(sdk.construct).toHaveBeenLastCalledWith(
+      expect.objectContaining({ endpoint: 'http://127.0.0.1:9001' }),
+    );
+    endpointRotated.storage.close();
+  });
+
   it('rejects different encrypted content even when timestamp and size match', async () => {
     const f = await fixture();
     const other = join(f.directory, 'other.rdb');

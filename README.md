@@ -109,7 +109,7 @@ The machine-readable contract is [openapi.yaml](./openapi.yaml), validated in th
 | `POST /admin/api/dead-letter/:taskId/replay` | Basic                     | Re-enqueue as a new job owned by the original tenant; `202` with `taskId` and `replayOf`       |
 | `DELETE /admin/api/dead-letter/:taskId`      | Basic                     | Discard an entry; `204`                                                                        |
 | `GET /admin/api/audit?limit`                 | Basic                     | Newest admin audit records (1–1000, default 100)                                               |
-| `POST /admin/api/secrets/reload`             | Admin                     | Reload API keys on this replica and audit the result                                           |
+| `POST /admin/api/secrets/reload`             | Admin                     | Reload supported credentials on this replica and audit the result                              |
 
 With `ADMIN_AUTH_MODE=basic` (default), the admin surface returns `503` until `ADMIN_PASSWORD` (at least 12 characters) is configured, so a default deployment never exposes it anonymously. Basic credentials are compared in constant time and grant the effective `admin` role. The table above describes this default; OIDC accepts Bearer tokens or browser sessions instead. After `ADMIN_AUTH_MAX_FAILURES` rejected logins (default 10) from one client IP within `ADMIN_AUTH_WINDOW_MS` (default 15 minutes), every `/admin` request from that IP returns `429` until the window ends; successful requests, such as Bull Board's polling, are not counted. Only the `api` and `all` roles mount the task and admin routes.
 
@@ -218,7 +218,7 @@ the same provider key; it checks one effective application and the stored result
 
 ## What Is Not Implemented
 
-There is no transactional outbox for task acceptance or administrative mutations. Optional WORM audit archival is not an atomic dual write with Redis; outbox mode retries after successful enqueue but cannot automatically backfill a failed enqueue. API keys have no self-service issuance or automatic expiry. API key reload does not rotate Redis, OIDC, admin or archive credentials, and Vault token renewal is not implemented. Sentinel restores access to a promoted replica, but asynchronous replication can lose acknowledged writes and is not a zero-data-loss guarantee. OIDC sessions end at access-token expiry, without refresh or immediate token revocation checks. HTTP job idempotency and job results last only as long as job retention; the invoice effect record has a separate retention. Timeouts are per process; the circuit is shared in Redis and counts consecutive completions rather than failures in a rolling time window. The dead-letter copy is not atomic with the failure (see above). The audit stream is capped and lives in the same Redis; optional S3 Object Lock protects successfully archived object versions, but there is no cryptographic audit chain. The billing service is a mock and notifications are not sent. Redis Cluster and Helm/Kubernetes manifests remain future work.
+There is no transactional outbox for task acceptance or administrative mutations. Optional WORM audit archival is not an atomic dual write with Redis; outbox mode retries after successful enqueue but cannot automatically backfill a failed enqueue. API keys have no self-service issuance or automatic expiry. Redis credentials and backup encryption keys require controlled restarts. Sentinel restores access to a promoted replica, but asynchronous replication can lose acknowledged writes and is not a zero-data-loss guarantee. OIDC sessions end at access-token expiry, without refresh or immediate token revocation checks. HTTP job idempotency and job results last only as long as job retention; the invoice effect record has a separate retention. Timeouts are per process; the circuit is shared in Redis and counts consecutive completions rather than failures in a rolling time window. The dead-letter copy is not atomic with the failure (see above). The audit stream is capped and lives in the same Redis; optional S3 Object Lock protects successfully archived object versions, but there is no cryptographic audit chain. The billing service is a mock and notifications are not sent. Redis Cluster and Helm/Kubernetes manifests remain future work.
 
 ## Testing Strategy
 
@@ -625,24 +625,37 @@ logged or written to `.env` files.
 | `VAULT_SECRET_PATH`                 | Required KV v2 HTTP path `<mount>/data/<secret>`, not the CLI path; example `secret/data/task-queue`                   |
 | `VAULT_NAMESPACE`                   | Optional `X-Vault-Namespace` header                                                                                    |
 | `VAULT_TIMEOUT_MS`                  | `5000`, bounded per login/read request                                                                                 |
+| `VAULT_TOKEN_RENEW_INTERVAL_MS`     | `60000`; fixed renewal interval, configure below the token TTL                                                         |
 | `VAULT_DEV_ROOT_TOKEN`              | Local OpenBao profile only; default `local-openbao-root-token`                                                         |
 
 Missing credentials/address/path, rejected tokens, unavailable storage, timeout,
 wrong KV versions, invalid secrets or non-string sensitive values abort startup
 with exit code 1 and sanitized diagnostics. There is **no fallback to env mode**
 after a Vault failure. Final app configuration is also validated before clients
-are created. `API_KEYS` alone can be reloaded without restarting. Update it in
+are created. Each process renews its in-memory token with `auth/token/renew-self`
+on the configured interval, with bounded jittered retry on failure. AppRole logs in
+again on renewal HTTP 400/403 and retries a KV read once on HTTP 403. Static tokens
+that are non-renewable or revoked require replacement and restart; AppRole role/secret
+IDs are fixed until restart. Configure renewal faster than the shortest token TTL.
+Update secrets in
 Vault/OpenBao, or in a file mounted into each process and named by `API_KEYS_FILE`
 when using the env provider. Process environment variables themselves cannot be
 changed from outside a running process. Set `SECRETS_REFRESH_INTERVAL_MS` to a
 positive interval or call `POST /admin/api/secrets/reload` on **each** API replica
 using an admin credential. The endpoint is audited; viewer access is denied.
 Changes apply when each reload succeeds, not simultaneously across replicas. Failures
-are logged and retain the previous keys. If all keys are removed after authentication
+are logged and retain the previous credentials. If all keys are removed after authentication
 was enabled, requests are denied rather than becoming anonymous. Preserve tenant IDs
 while overlapping old and new keys. Vault keys absent from the secret fall back to the
 original environment; explicitly set `API_KEYS` to an empty string to revoke all.
-Other secrets and Vault auth credentials require restart; token renewal is not implemented.
+The response lists `applied`, `restartRequired`, and `restartRequiredKeys`: API keys,
+admin password, OIDC client/session secrets and configured WORM credentials can be
+applied locally; changing `SESSION_SECRET` invalidates sessions and pending logins.
+The current process does not replace Redis/BullMQ connections. Drain and restart all
+affected processes if Redis credentials change. A WORM sink that was not configured
+at startup also requires restart. Backup agents use their own Vault identity, refresh
+their S3 client before each capture, and are not changed by the API endpoint. Backup
+encryption-key rotation requires controlled restart and retaining historical keys.
 
 The optional `secrets` profile runs OpenBao in **development mode**: in-memory
 storage, loopback port 8200, a known root token which the dev server prints, and

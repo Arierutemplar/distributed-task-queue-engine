@@ -11,6 +11,9 @@ const apiKey = 'vault-api-key-0123456789abcdef0123456789';
 const password = 'vault-loaded-admin-password';
 const vaultToken = 'vault-child-token';
 let vaultKeys = apiKey;
+let vaultPassword = password;
+let wormAccess = 'original-access';
+let wormSecret = 'original-secret';
 let vault: Server;
 let address: string;
 let redisUrl = TEST_REDIS_URL;
@@ -32,8 +35,10 @@ beforeAll(async () => {
         data: {
           data: {
             API_KEYS: vaultKeys,
-            ADMIN_PASSWORD: password,
+            ADMIN_PASSWORD: vaultPassword,
             REDIS_URL: redisUrl,
+            AUDIT_WORM_ACCESS_KEY_ID: wormAccess,
+            AUDIT_WORM_SECRET_ACCESS_KEY: wormSecret,
           },
         },
       }),
@@ -45,6 +50,9 @@ beforeAll(async () => {
 beforeEach(async () => {
   redisUrl = TEST_REDIS_URL;
   vaultKeys = apiKey;
+  vaultPassword = password;
+  wormAccess = 'original-access';
+  wormSecret = 'original-secret';
   await resetState();
 });
 afterAll(async () => {
@@ -115,6 +123,129 @@ const start = (env: NodeJS.ProcessEnv) => {
 };
 
 describe('preload before runtime configuration for API and worker entry points', () => {
+  it('switches the live WORM S3 client after Vault credentials rotate', async () => {
+    const authorizations: string[] = [];
+    const s3 = createServer((request, response) => {
+      authorizations.push(request.headers.authorization ?? '');
+      request.resume();
+      request.on('end', () => {
+        response.setHeader('x-amz-version-id', 'version-1');
+        response.end();
+      });
+    });
+    await new Promise<void>((done) => s3.listen(0, '127.0.0.1', done));
+    const s3Port = (s3.address() as AddressInfo).port;
+    const port = await freePort();
+    const process = start({
+      PROCESS_ROLE: 'api',
+      PORT: String(port),
+      SECRETS_REFRESH_INTERVAL_MS: '0',
+      AUDIT_WORM_ENABLED: 'true',
+      AUDIT_WORM_ENDPOINT: `http://127.0.0.1:${s3Port}`,
+    });
+    const base = `http://127.0.0.1:${port}`;
+    const authorization = `Basic ${Buffer.from(`admin:${password}`).toString('base64')}`;
+    try {
+      await waitFor(async () => {
+        if (process.child.exitCode !== null) throw new Error(process.output());
+        try {
+          return (await fetch(`${base}/health/ready`)).ok;
+        } catch (error: unknown) {
+          if (error instanceof TypeError) return false;
+          throw error;
+        }
+      }, 'child process readiness');
+      expect(
+        (await fetch(`${base}/admin/api/audit`, { headers: { Authorization: authorization } }))
+          .status,
+      ).toBe(200);
+      wormAccess = 'rotated-access';
+      wormSecret = 'rotated-secret';
+      const reload = await fetch(`${base}/admin/api/secrets/reload`, {
+        method: 'POST',
+        headers: { Authorization: authorization },
+      });
+      expect(reload.status).toBe(200);
+      expect(((await reload.json()) as { applied: string[] }).applied).toEqual(
+        expect.arrayContaining(['AUDIT_WORM_ACCESS_KEY_ID', 'AUDIT_WORM_SECRET_ACCESS_KEY']),
+      );
+      await waitFor(
+        async () => authorizations.some((header) => header.includes('Credential=rotated-access/')),
+        'rotated WORM credentials',
+      );
+      expect(authorizations.some((header) => header.includes('Credential=original-access/'))).toBe(
+        true,
+      );
+    } finally {
+      process.child.kill();
+      await process.exited;
+      s3.closeAllConnections();
+      await new Promise<void>((done) => {
+        s3.close(() => {
+          done();
+        });
+      });
+    }
+  });
+
+  it('rotates admin credentials while reporting Redis changes without disconnecting', async () => {
+    const port = await freePort();
+    const process = start({
+      PROCESS_ROLE: 'api',
+      PORT: String(port),
+      SECRETS_REFRESH_INTERVAL_MS: '0',
+    });
+    const base = `http://127.0.0.1:${port}`;
+    const auth = (value: string) => `Basic ${Buffer.from(`admin:${value}`).toString('base64')}`;
+    try {
+      await waitFor(async () => {
+        if (process.child.exitCode !== null) throw new Error(process.output());
+        try {
+          return (await fetch(`${base}/health/ready`)).ok;
+        } catch (error: unknown) {
+          if (error instanceof TypeError) return false;
+          throw error;
+        }
+      }, 'child process readiness');
+      vaultPassword = 'rotated-admin-password';
+      redisUrl = 'redis://127.0.0.1:1';
+      const response = await fetch(`${base}/admin/api/secrets/reload`, {
+        method: 'POST',
+        headers: { Authorization: auth(password) },
+      });
+      expect(response.status).toBe(200);
+      const result = (await response.json()) as {
+        applied: string[];
+        restartRequired: boolean;
+        restartRequiredKeys: string[];
+      };
+      expect(result.applied).toContain('ADMIN_PASSWORD');
+      expect(result.restartRequired).toBe(true);
+      expect(result.restartRequiredKeys).toContain('REDIS_URL');
+      expect(JSON.stringify(result)).not.toContain(vaultPassword);
+      expect(
+        (await fetch(`${base}/admin/api/audit`, { headers: { Authorization: auth(password) } }))
+          .status,
+      ).toBe(401);
+      expect(
+        (
+          await fetch(`${base}/admin/api/audit`, {
+            headers: { Authorization: auth(vaultPassword) },
+          })
+        ).status,
+      ).toBe(200);
+      expect((await fetch(`${base}/health/ready`)).status).toBe(200);
+      const repeated = await fetch(`${base}/admin/api/secrets/reload`, {
+        method: 'POST',
+        headers: { Authorization: auth(vaultPassword) },
+      });
+      expect(((await repeated.json()) as { restartRequired: boolean }).restartRequired).toBe(true);
+    } finally {
+      process.child.kill();
+      await process.exited;
+    }
+  });
+
   it('reloads Vault keys through the admin endpoint and periodically, without reopening access', async () => {
     const port = await freePort();
     const process = start({

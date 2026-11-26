@@ -27,6 +27,8 @@ export class AuditArchiveError extends Error {
 
 export interface AuditWormSink extends AuditSink {
   deliver: (record: AuditRecord) => Promise<void>;
+  updateCredentials: (accessKeyId: string, secretAccessKey: string) => void;
+  updateSettings: (settings: AppConfig) => void;
 }
 
 export const createAuditWormSink = (
@@ -40,33 +42,48 @@ export const createAuditWormSink = (
     log.warn('WORM archive is enabled but credentials are incomplete; using Redis/logs only');
     return undefined;
   }
-  const client: AuditS3Client =
-    options.client ??
+  let activeSettings: AppConfig = { ...settings };
+  if (!activeSettings.AUDIT_WORM_ACCESS_KEY_ID || !activeSettings.AUDIT_WORM_SECRET_ACCESS_KEY)
+    throw new Error('WORM credentials must be complete');
+  const createClient = (
+    candidate: AppConfig,
+    accessKeyId: string,
+    secretAccessKey: string,
+  ): AuditS3Client =>
     new S3Client({
-      endpoint: settings.AUDIT_WORM_ENDPOINT,
-      region: settings.AUDIT_WORM_REGION,
-      forcePathStyle: settings.AUDIT_WORM_FORCE_PATH_STYLE,
-      credentials: {
-        accessKeyId: settings.AUDIT_WORM_ACCESS_KEY_ID,
-        secretAccessKey: settings.AUDIT_WORM_SECRET_ACCESS_KEY,
-      },
+      endpoint: candidate.AUDIT_WORM_ENDPOINT,
+      region: candidate.AUDIT_WORM_REGION,
+      forcePathStyle: candidate.AUDIT_WORM_FORCE_PATH_STYLE,
+      credentials: { accessKeyId, secretAccessKey },
       maxAttempts: 1,
     });
+  let client: AuditS3Client =
+    options.client ??
+    createClient(
+      activeSettings,
+      activeSettings.AUDIT_WORM_ACCESS_KEY_ID,
+      activeSettings.AUDIT_WORM_SECRET_ACCESS_KEY,
+    );
   const now = options.now ?? (() => new Date());
   const pending = new Set<Promise<void>>();
+  const clients = new Map<AuditS3Client, Set<Promise<void>>>([[client, new Set()]]);
   let closed = false;
 
-  const archive = async (record: AuditRecord): Promise<void> => {
-    const bucket = settings.AUDIT_WORM_BUCKET;
-    const key = `${encodeURIComponent(settings.SERVICE_NAME)}/${record.timestamp.slice(0, 10)}/${record.archiveId ?? randomUUID()}.json`;
+  const archive = async (
+    record: AuditRecord,
+    activeClient: AuditS3Client,
+    deliverySettings: AppConfig,
+  ): Promise<void> => {
+    const bucket = deliverySettings.AUDIT_WORM_BUCKET;
+    const key = `${encodeURIComponent(deliverySettings.SERVICE_NAME)}/${record.timestamp.slice(0, 10)}/${record.archiveId ?? randomUUID()}.json`;
     try {
       const body = JSON.stringify(record);
       const retainUntil = new Date(
-        now().getTime() + settings.AUDIT_WORM_RETENTION_DAYS * 86_400_000,
+        now().getTime() + deliverySettings.AUDIT_WORM_RETENTION_DAYS * 86_400_000,
       );
       const result = await withTimeout(
         (signal) =>
-          client.send(
+          activeClient.send(
             new PutObjectCommand({
               Bucket: bucket,
               Key: key,
@@ -74,12 +91,12 @@ export const createAuditWormSink = (
               ContentType: 'application/json',
               ChecksumAlgorithm: 'SHA256',
               ChecksumSHA256: createHash('sha256').update(body).digest('base64'),
-              ObjectLockMode: settings.AUDIT_WORM_LOCK_MODE,
+              ObjectLockMode: deliverySettings.AUDIT_WORM_LOCK_MODE,
               ObjectLockRetainUntilDate: retainUntil,
             }),
             { abortSignal: signal },
           ),
-        settings.AUDIT_WORM_TIMEOUT_MS,
+        deliverySettings.AUDIT_WORM_TIMEOUT_MS,
       );
       if (!result.VersionId || result.VersionId === 'null') {
         throw new Error('Archive destination did not return a versioned object');
@@ -89,7 +106,7 @@ export const createAuditWormSink = (
           bucket,
           key,
           versionId: result.VersionId,
-          lockMode: settings.AUDIT_WORM_LOCK_MODE,
+          lockMode: deliverySettings.AUDIT_WORM_LOCK_MODE,
           retainUntil: retainUntil.toISOString(),
         },
         'WORM audit write succeeded',
@@ -123,15 +140,57 @@ export const createAuditWormSink = (
       log.error('WORM archive is closed; record remains in Redis/logs only');
       return Promise.reject(new AuditArchiveError('ArchiveClosed'));
     }
-    const operation = archive(record);
+    const activeClient = client;
+    const deliverySettings = activeSettings;
+    const operations = clients.get(activeClient);
+    if (!operations) throw new Error('WORM client is unavailable');
+    const operation = archive(record, activeClient, deliverySettings);
     pending.add(operation);
+    operations.add(operation);
     return operation.finally(() => {
       pending.delete(operation);
+      operations.delete(operation);
+      if (activeClient !== client && operations.size === 0) {
+        activeClient.destroy();
+        clients.delete(activeClient);
+      }
     });
   };
 
   return {
     deliver,
+    updateCredentials(accessKeyId, secretAccessKey) {
+      activeSettings = {
+        ...activeSettings,
+        AUDIT_WORM_ACCESS_KEY_ID: accessKeyId,
+        AUDIT_WORM_SECRET_ACCESS_KEY: secretAccessKey,
+      };
+      const previous = client;
+      client = createClient(activeSettings, accessKeyId, secretAccessKey);
+      clients.set(client, new Set());
+      const operations = clients.get(previous);
+      if (operations?.size === 0) {
+        previous.destroy();
+        clients.delete(previous);
+      }
+    },
+    updateSettings(candidate) {
+      activeSettings = { ...candidate };
+      const previous = client;
+      if (!activeSettings.AUDIT_WORM_ACCESS_KEY_ID || !activeSettings.AUDIT_WORM_SECRET_ACCESS_KEY)
+        throw new Error('Reloaded WORM credentials must be complete');
+      client = createClient(
+        activeSettings,
+        activeSettings.AUDIT_WORM_ACCESS_KEY_ID,
+        activeSettings.AUDIT_WORM_SECRET_ACCESS_KEY,
+      );
+      clients.set(client, new Set());
+      const operations = clients.get(previous);
+      if (operations?.size === 0) {
+        previous.destroy();
+        clients.delete(previous);
+      }
+    },
     async write(record) {
       try {
         await deliver(record);
@@ -143,7 +202,8 @@ export const createAuditWormSink = (
     async close() {
       closed = true;
       await Promise.allSettled(pending);
-      client.destroy();
+      for (const activeClient of clients.keys()) activeClient.destroy();
+      clients.clear();
     },
   };
 };

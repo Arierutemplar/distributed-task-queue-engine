@@ -269,22 +269,29 @@ paths:
         '503': { $ref: '#/components/responses/Error' }
   /admin/api/secrets/reload:
     post:
-      summary: Reload API keys on this API process
-      description: Admin only; reloads the configured Vault/OpenBao secret or API_KEYS_FILE, records an audit event, and preserves the previous keys on failure.
+      summary: Reload credentials on this API process
+      description: Admin only; reloads API keys, admin, OIDC and active WORM credentials on this replica. Redis credentials remain unchanged and require a controlled restart when reported. Backup runs in a separate process and refreshes independently. Records an audit event and preserves previous credentials on validation failure.
       security:
         - BasicAuth: []
         - OidcBearer: []
         - AdminSession: []
       responses:
         '200':
-          description: Keys reloaded
+          description: Reload result without secret values
           content:
             application/json:
               schema:
                 type: object
-                required: [status]
+                required: [status, applied, restartRequired, restartRequiredKeys]
                 properties:
                   status: { type: string, enum: [reloaded] }
+                  applied:
+                    type: array
+                    items: { type: string }
+                  restartRequired: { type: boolean }
+                  restartRequiredKeys:
+                    type: array
+                    items: { type: string }
         '401': { $ref: '#/components/responses/UnauthorizedAdmin' }
         '403': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }

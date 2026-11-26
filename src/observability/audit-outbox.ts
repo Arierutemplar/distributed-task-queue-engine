@@ -45,7 +45,7 @@ export const createAuditOutbox = (
   settings: AppConfig,
   producer: Redis,
   consumer: Redis,
-  archive: AuditWormSink,
+  archive: Pick<AuditWormSink, 'deliver' | 'close'>,
   logger: Logger,
 ): AuditOutbox => {
   const name = 'audit-worm-outbox';

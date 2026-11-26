@@ -24,6 +24,7 @@ import { taskQueue } from './queues/task.queue.js';
 import type { TaskJobData, TaskResult, TaskType } from './types/task.types.js';
 import { createTaskWorker } from './workers/task.worker.js';
 import { createSecretsReloader, type SecretsReloader } from './config/secrets-reload.js';
+import type { SecretsProvider } from './config/secrets.js';
 
 let worker: Worker<TaskJobData, TaskResult, TaskType> | undefined;
 let server: Server | undefined;
@@ -32,6 +33,7 @@ let auditSink: AuditSink | undefined;
 let reconciler: MaintenanceLoop | undefined;
 let refreshTimer: NodeJS.Timeout | undefined;
 let secretsReloader: SecretsReloader | undefined;
+let secretsProvider: SecretsProvider | undefined;
 
 const lifecycle = createGracefulShutdown({
   logger,
@@ -45,6 +47,10 @@ const lifecycle = createGracefulShutdown({
     const activeAuditSink = auditSink;
     const activeReconciler = reconciler;
     if (refreshTimer) clearInterval(refreshTimer);
+    if (secretsProvider) {
+      const activeProvider = secretsProvider;
+      steps.push({ name: 'secrets provider', close: () => activeProvider.close() });
+    }
     if (activeServer) {
       steps.push({ name: 'HTTP server', close: () => closeServer(activeServer) });
     }
@@ -129,25 +135,72 @@ const startServer = async (initialEnvironment: NodeJS.ProcessEnv): Promise<void>
     worker = createTaskWorker();
   }
 
-  if (runsApi(config.PROCESS_ROLE)) {
-    secretsReloader = createSecretsReloader(config.API_KEYS, initialEnvironment);
-    if (config.SECRETS_REFRESH_INTERVAL_MS > 0) {
-      const reloader = secretsReloader;
-      let refreshing = false;
-      refreshTimer = setInterval(() => {
-        if (refreshing) return;
-        refreshing = true;
-        void reloader
-          .reload()
-          .catch((error: unknown) => {
-            logger.error({ err: error }, 'Secrets refresh failed; retaining previous API keys');
-          })
-          .finally(() => {
-            refreshing = false;
-          });
-      }, config.SECRETS_REFRESH_INTERVAL_MS);
-      refreshTimer.unref();
-    }
+  secretsReloader = createSecretsReloader(
+    config.API_KEYS,
+    initialEnvironment,
+    secretsProvider,
+    process.env,
+  );
+  if (archive) {
+    secretsReloader.register((candidate, changed) => {
+      const wormKeys = [
+        'AUDIT_WORM_ACCESS_KEY_ID',
+        'AUDIT_WORM_SECRET_ACCESS_KEY',
+        'AUDIT_WORM_ENDPOINT',
+        'AUDIT_WORM_REGION',
+        'AUDIT_WORM_BUCKET',
+        'AUDIT_WORM_FORCE_PATH_STYLE',
+        'AUDIT_WORM_LOCK_MODE',
+        'AUDIT_WORM_RETENTION_DAYS',
+        'AUDIT_WORM_TIMEOUT_MS',
+      ] as const;
+      const applied = changed.filter((key) => (wormKeys as readonly string[]).includes(key));
+      if (applied.length === 0) return { applied, commit: () => undefined };
+      if (!candidate.AUDIT_WORM_ACCESS_KEY_ID || !candidate.AUDIT_WORM_SECRET_ACCESS_KEY)
+        throw new Error('Reloaded WORM credentials must be complete');
+      const updated = {
+        ...config,
+        AUDIT_WORM_ACCESS_KEY_ID: candidate.AUDIT_WORM_ACCESS_KEY_ID,
+        AUDIT_WORM_SECRET_ACCESS_KEY: candidate.AUDIT_WORM_SECRET_ACCESS_KEY,
+        ...(candidate.AUDIT_WORM_ENDPOINT !== undefined
+          ? { AUDIT_WORM_ENDPOINT: candidate.AUDIT_WORM_ENDPOINT }
+          : {}),
+        AUDIT_WORM_REGION: candidate.AUDIT_WORM_REGION,
+        AUDIT_WORM_BUCKET: candidate.AUDIT_WORM_BUCKET,
+        AUDIT_WORM_FORCE_PATH_STYLE: candidate.AUDIT_WORM_FORCE_PATH_STYLE,
+        AUDIT_WORM_LOCK_MODE: candidate.AUDIT_WORM_LOCK_MODE,
+        AUDIT_WORM_RETENTION_DAYS: candidate.AUDIT_WORM_RETENTION_DAYS,
+        AUDIT_WORM_TIMEOUT_MS: candidate.AUDIT_WORM_TIMEOUT_MS,
+      };
+      return {
+        applied,
+        commit: () => {
+          archive.updateSettings(updated);
+        },
+      };
+    });
+  }
+  if (config.SECRETS_REFRESH_INTERVAL_MS > 0) {
+    const reloader = secretsReloader;
+    let refreshing = false;
+    refreshTimer = setInterval(() => {
+      if (refreshing) return;
+      refreshing = true;
+      void reloader
+        .reload()
+        .then((result) => {
+          if (result.restartRequired) {
+            logger.warn({ keys: result.restartRequiredKeys }, 'Secrets require controlled restart');
+          }
+        })
+        .catch((error: unknown) => {
+          logger.error({ err: error }, 'Secrets refresh failed; retaining previous credentials');
+        })
+        .finally(() => {
+          refreshing = false;
+        });
+    }, config.SECRETS_REFRESH_INTERVAL_MS);
+    refreshTimer.unref();
   }
 
   const app = await createApp({
@@ -193,7 +246,11 @@ process.on('uncaughtException', (error: Error) => {
   void shutdown('uncaughtException');
 });
 
-export const startRuntime = (initialEnvironment: NodeJS.ProcessEnv): void => {
+export const startRuntime = (
+  initialEnvironment: NodeJS.ProcessEnv,
+  provider?: SecretsProvider,
+): void => {
+  secretsProvider = provider;
   void startServer(initialEnvironment).catch(async (error: unknown) => {
     logger.fatal({ err: error }, 'Failed to start task service');
     process.exitCode = 1;

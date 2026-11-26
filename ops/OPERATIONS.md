@@ -255,8 +255,24 @@ use independent backups. Do not rely on this fixture as a production deployment.
   `SECRETS_REFRESH_INTERVAL_MS`, migrate clients, then remove the old key and refresh
   again. Verify old and new credentials on every replica. Empty keys after secured
   startup deny all callers. Refresh failures retain previous keys and must be alerted;
-  Vault missing fields fall back to startup environment values. Admin/Redis/OIDC/S3
-  credentials are not hot-swapped and require a controlled restart.
+  Vault missing fields fall back to startup environment values.
+- Set `VAULT_TOKEN_RENEW_INTERVAL_MS` below the shortest token TTL (default 60000 ms);
+  renewal uses `auth/token/renew-self`, retries failures with bounded jittered backoff,
+  and AppRole re-authenticates when renewal is rejected with 400/403. Monitor structured
+  lifecycle failures. Static non-renewable or revoked tokens must be replaced and the
+  process restarted. Secret ID rotation also requires restart.
+- Refresh every API replica after rotating `ADMIN_PASSWORD`, `OIDC_CLIENT_SECRET`,
+  `SESSION_SECRET` or active `AUDIT_WORM_*` credentials. A session-secret change
+  invalidates existing browser sessions and pending logins. Existing WORM writes finish
+  on the old S3 client; subsequent writes use the replacement. Enable periodic refresh
+  for worker processes too. An initially unconfigured WORM sink requires a restart.
+- Inspect `restartRequired` and `restartRequiredKeys` on every reload response. Redis
+  connections and BullMQ locks are not replaced: overlap Redis credentials, drain
+  workers, restart each API/worker with new credentials, verify readiness, then revoke
+  old credentials. Backup agents have their own Vault identity and refresh their S3
+  client before each capture, not through the API endpoint. Rotating backup encryption
+  keys or Redis credentials requires a separately planned restart and preservation
+  of old decryption keys.
 - Task payloads may omit `schemaVersion` (equivalent to `1`) or explicitly use `1`.
   Deploy consumers that support a new version before allowing producers to send it;
   unsupported versions are rejected by the API or fail without retry if inserted directly.

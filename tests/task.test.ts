@@ -496,4 +496,56 @@ describe('API key authentication and tenant isolation', () => {
       expect.objectContaining({ action: 'admin.secrets_reload', outcome: 'success' }),
     );
   });
+
+  it('rotates basic admin credentials and reports persistent Redis restart requirements', async () => {
+    const source = {
+      NODE_ENV: 'test',
+      API_KEYS: KEY_A,
+      ADMIN_PASSWORD: 'old-admin-password',
+      REDIS_URL: 'redis://127.0.0.1:6379',
+    };
+    const settings = loadConfig(source);
+    const reloader = createSecretsReloader(settings.API_KEYS, source);
+    const app = await createApp({
+      config: settings,
+      secretsReloader: reloader,
+      auditLog: { record: vi.fn(async () => undefined), list: vi.fn(async () => []) },
+    });
+    source.ADMIN_PASSWORD = 'new-admin-password';
+    source.REDIS_URL = 'redis://127.0.0.1:6380';
+    const response = await request(app)
+      .post('/admin/api/secrets/reload')
+      .auth('admin', 'old-admin-password');
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      applied: expect.arrayContaining(['API_KEYS', 'ADMIN_PASSWORD']),
+      restartRequired: true,
+      restartRequiredKeys: ['REDIS_URL'],
+    });
+    expect(JSON.stringify(response.body)).not.toContain('new-admin-password');
+    expect(
+      (await request(app).get('/admin/api/audit').auth('admin', 'old-admin-password')).status,
+    ).toBe(401);
+    expect(
+      (await request(app).get('/admin/api/audit').auth('admin', 'new-admin-password')).status,
+    ).toBe(200);
+    const again = await request(app)
+      .post('/admin/api/secrets/reload')
+      .auth('admin', 'new-admin-password');
+    expect(again.body.restartRequiredKeys).toEqual(['REDIS_URL']);
+    source.ADMIN_PASSWORD = 'short';
+    source.API_KEYS = KEY_B;
+    expect(
+      (await request(app).post('/admin/api/secrets/reload').auth('admin', 'new-admin-password'))
+        .status,
+    ).toBe(500);
+    expect(
+      (
+        await request(app)
+          .post('/api/v1/tasks/process')
+          .set('X-API-Key', KEY_A)
+          .send(documentPayload)
+      ).status,
+    ).toBe(202);
+  });
 });

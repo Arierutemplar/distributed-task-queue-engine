@@ -161,6 +161,33 @@ export const createBackupStorage = (settings: BackupSettings): BackupStorage => 
   };
 };
 
+export const rotateBackupStorage = (
+  settings: BackupSettings,
+  storage: BackupStorage,
+  candidate: BackupSettings,
+): { settings: BackupSettings; storage: BackupStorage; changed: boolean } => {
+  if (
+    candidate.BACKUP_S3_ACCESS_KEY_ID === settings.BACKUP_S3_ACCESS_KEY_ID &&
+    candidate.BACKUP_S3_SECRET_ACCESS_KEY === settings.BACKUP_S3_SECRET_ACCESS_KEY &&
+    candidate.BACKUP_S3_ENDPOINT === settings.BACKUP_S3_ENDPOINT &&
+    candidate.BACKUP_S3_BUCKET === settings.BACKUP_S3_BUCKET &&
+    candidate.BACKUP_S3_REGION === settings.BACKUP_S3_REGION
+  ) {
+    return { settings, storage, changed: false };
+  }
+  const updated = {
+    ...settings,
+    BACKUP_S3_ENDPOINT: candidate.BACKUP_S3_ENDPOINT,
+    BACKUP_S3_BUCKET: candidate.BACKUP_S3_BUCKET,
+    BACKUP_S3_REGION: candidate.BACKUP_S3_REGION,
+    BACKUP_S3_ACCESS_KEY_ID: candidate.BACKUP_S3_ACCESS_KEY_ID,
+    BACKUP_S3_SECRET_ACCESS_KEY: candidate.BACKUP_S3_SECRET_ACCESS_KEY,
+  };
+  const replacement = createBackupStorage(updated);
+  storage.close();
+  return { settings: updated, storage: replacement, changed: true };
+};
+
 const magic = Buffer.from('DTQRDB01');
 const headerLength = 28;
 const overhead = headerLength + 16;

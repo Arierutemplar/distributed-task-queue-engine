@@ -1,11 +1,13 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { createHash } from 'node:crypto';
 import type { Express } from 'express';
-import { exportJWK, generateKeyPair, SignJWT } from 'jose';
+import { exportJWK, generateKeyPair, jwtDecrypt, SignJWT } from 'jose';
 import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app.js';
 import { loadConfig } from '../../src/config/env.js';
+import { createSecretsReloader } from '../../src/config/secrets-reload.js';
 import { deadLetterQueue } from '../../src/queues/dead-letter.queue.js';
 import { taskQueue } from '../../src/queues/task.queue.js';
 import { taskPayloadSchema } from '../../src/types/task.types.js';
@@ -20,14 +22,23 @@ let app: Express;
 let server: Server;
 let issuer: string;
 let pair: Awaited<ReturnType<typeof generateKeyPair>>;
+let exchange: { access_token: string; id_token: string };
+let exchangeBody: URLSearchParams;
 const audit = createIntegrationAuditLog();
 
 beforeAll(async () => {
   pair = await generateKeyPair('RS256');
   const key = await exportJWK(pair.publicKey);
-  server = createServer((_req, res) => {
+  server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ keys: [{ ...key, kid: 'integration', alg: 'RS256' }] }));
+    if (req.url?.endsWith('/certs')) {
+      res.end(JSON.stringify({ keys: [{ ...key, kid: 'integration', alg: 'RS256' }] }));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    exchangeBody = new URLSearchParams(Buffer.concat(chunks).toString());
+    res.end(JSON.stringify(exchange));
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   issuer = `http://127.0.0.1:${(server.address() as AddressInfo).port}/realms/task-queue`;
@@ -82,6 +93,72 @@ const seed = (id: string) =>
   );
 
 describe('OIDC RBAC on real administrative routes', () => {
+  it('uses the rotated OIDC client secret and invalidates sessions on session-key rotation', async () => {
+    const oldSessionSecret = 'old-integration-session-secret-0123456789';
+    const newSessionSecret = 'new-integration-session-secret-0123456789';
+    const source = {
+      ...process.env,
+      ADMIN_AUTH_MODE: 'oidc',
+      OIDC_ISSUER_URL: issuer,
+      OIDC_PUBLIC_ISSUER_URL: issuer,
+      OIDC_REDIRECT_URI: 'http://localhost:3000/admin/callback',
+      OIDC_CLIENT_SECRET: 'old-oidc-secret',
+      SESSION_SECRET: oldSessionSecret,
+    };
+    const settings = loadConfig(source);
+    const reloader = createSecretsReloader(settings.API_KEYS, source);
+    const rotatedApp = await createApp({
+      config: settings,
+      secretsReloader: reloader,
+      auditLog: audit,
+    });
+    const login = async (sessionSecret: string) => {
+      const start = await request(rotatedApp).get('/admin/login');
+      const cookie = (start.headers['set-cookie'] as unknown as string[])[0].split(';')[0];
+      const encrypted = cookie.slice(cookie.indexOf('=') + 1);
+      const transaction = (
+        await jwtDecrypt(encrypted, createHash('sha256').update(sessionSecret).digest())
+      ).payload;
+      exchange = {
+        access_token: await token('admin'),
+        id_token: await new SignJWT({ nonce: transaction.nonce })
+          .setProtectedHeader({ alg: 'RS256', kid: 'integration' })
+          .setIssuer(issuer)
+          .setAudience('task-queue-admin')
+          .setSubject('subject-admin')
+          .setIssuedAt()
+          .setExpirationTime('5m')
+          .sign(pair.privateKey),
+      };
+      return request(rotatedApp)
+        .get('/admin/callback')
+        .query({ state: transaction.state, code: 'code' })
+        .set('Cookie', cookie);
+    };
+    const before = await login(oldSessionSecret);
+    expect(before.status).toBe(302);
+    expect(exchangeBody.get('client_secret')).toBe('old-oidc-secret');
+    const session = (before.headers['set-cookie'] as unknown as string[])
+      .find((value) => value.startsWith('admin_session='))
+      ?.split(';')[0];
+    expect(session).toBeDefined();
+    source.OIDC_CLIENT_SECRET = 'new-oidc-secret';
+    source.SESSION_SECRET = newSessionSecret;
+    const result = await request(rotatedApp)
+      .post('/admin/api/secrets/reload')
+      .auth(await token('admin'), { type: 'bearer' });
+    expect(result.status).toBe(200);
+    expect(result.body.applied).toEqual(
+      expect.arrayContaining(['OIDC_CLIENT_SECRET', 'SESSION_SECRET']),
+    );
+    expect((await request(rotatedApp).get('/admin/api/audit').set('Cookie', session!)).status).toBe(
+      401,
+    );
+    const after = await login(newSessionSecret);
+    expect(after.status).toBe(302);
+    expect(exchangeBody.get('client_secret')).toBe('new-oidc-secret');
+  });
+
   it('allows viewer reads, denies writes before touching DLQ and persists identity in audit', async () => {
     await seed('viewer-job');
     const viewer = await token('viewer');

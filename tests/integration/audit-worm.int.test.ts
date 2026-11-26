@@ -1,4 +1,10 @@
 import { Writable } from 'node:stream';
+import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { mkdtemp, rmdir, unlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import pino from 'pino';
 import request from 'supertest';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +14,11 @@ import { deadLetterQueue } from '../../src/queues/dead-letter.queue.js';
 import { taskPayloadSchema } from '../../src/types/task.types.js';
 import { createAuditLog, type AuditRecord } from '../../src/observability/audit.js';
 import { createAuditWormSink, type AuditS3Client } from '../../src/observability/audit-worm.js';
+import {
+  createBackupStorage,
+  loadBackupSettings,
+  rotateBackupStorage,
+} from '../../src/operations/backup.js';
 import {
   AUDIT_STREAM_KEY,
   adminAuthHeader,
@@ -60,6 +71,54 @@ const setup = async (enabled = true) => {
 };
 
 describe('WORM export alongside real Redis and admin HTTP routes', () => {
+  it('signs backup uploads with the newly rotated S3 credentials', async () => {
+    const authorizations: string[] = [];
+    const server = createServer((request, response) => {
+      authorizations.push(request.headers.authorization ?? '');
+      request.resume();
+      request.on('end', () => {
+        response.setHeader('x-amz-version-id', 'version-1');
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const directory = await mkdtemp(join(tmpdir(), 'dtq-backup-rotation-'));
+    const file = join(directory, 'fixture');
+    const body = Buffer.from('backup-rotation-fixture');
+    await writeFile(file, body);
+    const settings = loadBackupSettings({
+      BACKUP_S3_ENDPOINT: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      BACKUP_S3_BUCKET: 'test-backups',
+      BACKUP_ENCRYPTION_KEY: 'aa'.repeat(32),
+      BACKUP_S3_ACCESS_KEY_ID: 'old-backup-access',
+      BACKUP_S3_SECRET_ACCESS_KEY: 'old-backup-secret',
+    });
+    let storage = createBackupStorage(settings);
+    const checksum = createHash('sha256').update(body).digest('base64');
+    const signal = new AbortController().signal;
+    try {
+      await storage.put('first', file, body.length, checksum, signal);
+      storage = rotateBackupStorage(settings, storage, {
+        ...settings,
+        BACKUP_S3_ACCESS_KEY_ID: 'new-backup-access',
+        BACKUP_S3_SECRET_ACCESS_KEY: 'new-backup-secret',
+      }).storage;
+      await storage.put('second', file, body.length, checksum, signal);
+      expect(authorizations[0]).toContain('Credential=old-backup-access/');
+      expect(authorizations[1]).toContain('Credential=new-backup-access/');
+    } finally {
+      storage.close();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => {
+        server.close(() => {
+          resolve();
+        });
+      });
+      await unlink(file);
+      await rmdir(directory);
+    }
+  });
+
   it('exports the same audit record with explicit lock and retention while keeping Redis/API behavior', async () => {
     const { app, audit, client, sink } = await setup();
     const response = await request(app)

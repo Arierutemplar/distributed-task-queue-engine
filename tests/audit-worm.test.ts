@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { Writable } from 'node:stream';
 import pino from 'pino';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -56,6 +58,62 @@ afterEach(() => {
 });
 
 describe('WORM audit sink', () => {
+  it('uses rotated S3 credentials for subsequent archive requests', async () => {
+    const authorizations: string[] = [];
+    const server = createServer((request, response) => {
+      authorizations.push(request.headers.authorization ?? '');
+      request.resume();
+      request.on('end', () => {
+        response.setHeader('x-amz-version-id', 'version-1');
+        response.end();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    const settings = loadConfig({
+      AUDIT_WORM_ENABLED: 'true',
+      AUDIT_WORM_ENDPOINT: `http://127.0.0.1:${port}`,
+      AUDIT_WORM_ACCESS_KEY_ID: 'first-access',
+      AUDIT_WORM_SECRET_ACCESS_KEY: 'first-secret',
+    });
+    const sink = createAuditWormSink(settings, pino({ level: 'silent' }));
+    try {
+      await sink?.deliver(record);
+      sink?.updateCredentials('next-access', 'next-secret');
+      await sink?.deliver(record);
+      expect(authorizations[0]).toContain('Credential=first-access/');
+      expect(authorizations[1]).toContain('Credential=next-access/');
+    } finally {
+      await sink?.close();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        }),
+      );
+    }
+  });
+
+  it('lets an in-flight archive complete before closing the replaced client', async () => {
+    const { sink, client } = setup();
+    let finish: ((value: { $metadata: object; VersionId: string }) => void) | undefined;
+    client.send.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const operation = sink?.deliver(record);
+    sink?.updateCredentials('next-access', 'next-secret');
+    expect(client.destroy).not.toHaveBeenCalled();
+    if (!finish) throw new Error('Archive request was not started');
+    finish({ $metadata: {}, VersionId: 'version' });
+    await operation;
+    expect(client.destroy).toHaveBeenCalledOnce();
+    await sink?.close();
+    expect(client.destroy).toHaveBeenCalledOnce();
+  });
+
   it.each(['GOVERNANCE', 'COMPLIANCE'])(
     'writes unique, checksummed objects with %s retention',
     async (mode) => {

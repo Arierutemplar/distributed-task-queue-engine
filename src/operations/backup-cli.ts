@@ -10,8 +10,8 @@ import { tmpdir } from 'node:os';
 import { Redis } from 'ioredis';
 import { Queue, QueueEvents, Worker } from 'bullmq';
 import { Gauge, Counter, Registry } from 'prom-client';
-import { loadSecrets, SecretsProviderError } from '../config/secrets.js';
-import { loadRedisSettings } from '../config/redis-settings.js';
+import { createSecretsProvider, SecretsProviderError } from '../config/secrets.js';
+import { loadRedisSettings, normalizeRedisSecret } from '../config/redis-settings.js';
 import { resolveRedisConnection } from '../config/redis-options.js';
 import { withTimeout } from '../resilience/timeout.js';
 import { processDocument } from '../services/document.service.js';
@@ -27,6 +27,7 @@ import {
   BackupError,
   createBackupStorage,
   loadBackupSettings,
+  rotateBackupStorage,
 } from './backup.js';
 import { restoreManifestSchema, verifyRestoreSamples } from './restore-samples.js';
 
@@ -105,10 +106,46 @@ const runWithDeadline = async <T>(
   }
 };
 
+const secrets = createSecretsProvider((event) => {
+  process.stderr.write(
+    `${JSON.stringify({ level: event.outcome === 'success' ? 30 : 50, msg: 'Vault token lifecycle', ...event })}\n`,
+  );
+});
 const main = async (): Promise<void> => {
-  await loadSecrets();
-  const settings = loadBackupSettings(process.env);
-  const storage = createBackupStorage(settings);
+  const initialEnvironment = { ...process.env };
+  await secrets.load(process.env);
+  let settings = loadBackupSettings(process.env);
+  let storage = createBackupStorage(settings);
+  const refreshStorage = async (): Promise<void> => {
+    const candidate = { ...initialEnvironment };
+    await secrets.load(candidate);
+    const next = loadBackupSettings(candidate);
+    const changedRedis = [
+      'REDIS_URL',
+      'REDIS_USERNAME',
+      'REDIS_PASSWORD',
+      'REDIS_SENTINEL_USERNAME',
+      'REDIS_SENTINEL_PASSWORD',
+    ].filter(
+      (key) => normalizeRedisSecret(candidate[key]) !== normalizeRedisSecret(process.env[key]),
+    );
+    if (changedRedis.length > 0) {
+      process.stderr.write(
+        `${JSON.stringify({ level: 40, msg: 'Backup Redis credentials require controlled restart', keys: changedRedis })}\n`,
+      );
+    }
+    const rotated = rotateBackupStorage(settings, storage, next);
+    storage = rotated.storage;
+    settings = rotated.settings;
+    if (rotated.changed) {
+      process.stdout.write('{"level":30,"msg":"Backup S3 credentials refreshed"}\n');
+    }
+    if (next.BACKUP_ENCRYPTION_KEY !== settings.BACKUP_ENCRYPTION_KEY) {
+      process.stderr.write(
+        '{"level":40,"msg":"Backup encryption key change requires controlled restart"}\n',
+      );
+    }
+  };
   const verifyRdb = (file: string, signal: AbortSignal): Promise<void> =>
     execute('redis-check-rdb', [file], signal);
 
@@ -354,6 +391,7 @@ const main = async (): Promise<void> => {
       }, settings.BACKUP_RTO_SECONDS * 1000);
     } finally {
       storage.close();
+      await secrets.close();
     }
     return;
   }
@@ -372,11 +410,13 @@ const main = async (): Promise<void> => {
       }
     } finally {
       storage.close();
+      await secrets.close();
     }
     return;
   }
   if (mode !== 'agent') {
     storage.close();
+    await secrets.close();
     throw new BackupError('Mode must be once, agent, restore-check or restore-export');
   }
   const registry = new Registry();
@@ -395,7 +435,11 @@ const main = async (): Promise<void> => {
   let running: Promise<void> | undefined;
   const run = (): Promise<void> => {
     if (running) return running;
-    running = runWithDeadline(capture, settings.BACKUP_TIMEOUT_MS)
+    running = runWithDeadline(async (signal) => {
+      await refreshStorage();
+      signal.throwIfAborted();
+      return capture(signal);
+    }, settings.BACKUP_TIMEOUT_MS)
       .then((report) => {
         lastVerified = Date.parse(report.capturedAt) / 1_000;
         last.set(lastVerified);
@@ -447,6 +491,7 @@ const main = async (): Promise<void> => {
       clearInterval(timer);
       await running;
       storage.close();
+      await secrets.close();
       await new Promise<void>((resolve, reject) =>
         http.close((error) => {
           if (error) reject(error);
@@ -464,7 +509,8 @@ const main = async (): Promise<void> => {
   void run();
 };
 
-void main().catch((error: unknown) => {
+void main().catch(async (error: unknown) => {
+  await secrets.close();
   process.stderr.write(
     `${JSON.stringify({
       level: 60,

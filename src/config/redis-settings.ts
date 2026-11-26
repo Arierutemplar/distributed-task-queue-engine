@@ -1,6 +1,9 @@
 import { isIP } from 'node:net';
 import { z } from 'zod';
 
+export const normalizeRedisSecret = (value: string | undefined): string | undefined =>
+  value?.trim() ? value : undefined;
+
 const optionalString = z.preprocess(
   (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
   z.string().optional(),

@@ -22,6 +22,12 @@ const vaultSchema = z
     VAULT_SECRET_PATH: z.string().refine((path) => safePath(path) && path.includes('/data/')),
     VAULT_NAMESPACE: optional,
     VAULT_TIMEOUT_MS: z.coerce.number().int().min(100).max(60_000).default(5_000),
+    VAULT_TOKEN_RENEW_INTERVAL_MS: z.coerce
+      .number()
+      .int()
+      .min(1_000)
+      .max(86_400_000)
+      .default(60_000),
     PRODUCTION_HARDENING_ENABLED: z.enum(['true', 'false']).default('false'),
   })
   .superRefine((settings, context) => {
@@ -58,6 +64,9 @@ const vaultSchema = z
 
 const kvResponse = z.object({ data: z.object({ data: z.record(z.string(), z.unknown()) }) });
 const loginResponse = z.object({ auth: z.object({ client_token: z.string().min(1) }) });
+const renewResponse = z.object({
+  auth: z.object({ client_token: z.string().min(1).optional() }),
+});
 const sensitiveKeys = new Set([
   'REDIS_URL',
   'REDIS_USERNAME',
@@ -76,15 +85,88 @@ const sensitiveKeys = new Set([
 ]);
 
 export class SecretsProviderError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
     super(message);
     this.name = 'SecretsProviderError';
   }
 }
 
+interface RenewalEvent {
+  action: 'renew' | 'reauthenticate';
+  outcome: 'success' | 'failure';
+}
+
+interface VaultSession {
+  token?: string;
+  start: (operation: () => Promise<RenewalEvent['action']>, interval: number) => void;
+}
+
+export interface SecretsProvider {
+  load: (source: NodeJS.ProcessEnv) => Promise<{ provider: 'env' | 'vault'; keys: string[] }>;
+  close: () => Promise<void>;
+}
+
+export const createSecretsProvider = (
+  onRenewal: (event: RenewalEvent) => void,
+): SecretsProvider => {
+  let pending: Promise<void> = Promise.resolve();
+  let timer: NodeJS.Timeout | undefined;
+  let closed = false;
+  let failures = 0;
+  const enqueue = <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = pending.then(operation, operation);
+    pending = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
+  const session: VaultSession = {
+    start(operation, interval) {
+      if (timer || closed) return;
+      const schedule = (delay: number): void => {
+        if (closed) return;
+        timer = setTimeout(() => {
+          timer = undefined;
+          void enqueue(operation)
+            .then((action) => {
+              failures = 0;
+              onRenewal({ action, outcome: 'success' });
+              schedule(interval);
+            })
+            .catch(() => {
+              failures += 1;
+              onRenewal({ action: 'renew', outcome: 'failure' });
+              const delay = Math.min(interval * 2 ** Math.min(failures - 1, 8), 300_000);
+              schedule(Math.round(delay * (0.8 + Math.random() * 0.4)));
+            });
+        }, delay);
+        timer.unref();
+      };
+      schedule(interval);
+    },
+  };
+  return {
+    load: (source) =>
+      enqueue(() => {
+        if (closed) throw new SecretsProviderError('Secrets provider is closed');
+        return loadSecrets(source, session);
+      }),
+    async close() {
+      closed = true;
+      if (timer) clearTimeout(timer);
+      await pending;
+    },
+  };
+};
+
 /** Loads atomically before env validation/client construction. Vault wins only for sensitive keys. */
 export const loadSecrets = async (
   source: NodeJS.ProcessEnv = process.env,
+  session?: VaultSession,
 ): Promise<{ provider: 'env' | 'vault'; keys: string[] }> => {
   const provider = source.SECRETS_PROVIDER?.trim() ?? 'env';
   if (provider === 'env' || provider === '') {
@@ -119,7 +201,10 @@ export const loadSecrets = async (
           redirect: 'error',
         });
         if (!response.ok)
-          throw new SecretsProviderError(`Vault request failed (HTTP ${response.status})`);
+          throw new SecretsProviderError(
+            `Vault request failed (HTTP ${response.status})`,
+            response.status,
+          );
         return await response.json();
       }, settings.VAULT_TIMEOUT_MS);
     } catch (error: unknown) {
@@ -130,8 +215,7 @@ export const loadSecrets = async (
     }
   };
 
-  let token = settings.VAULT_TOKEN;
-  if (settings.VAULT_AUTH_METHOD === 'approle') {
+  const login = async (): Promise<string> => {
     const login = loginResponse.safeParse(
       await jsonRequest(`auth/${settings.VAULT_APPROLE_PATH}/login`, {
         method: 'POST',
@@ -144,14 +228,31 @@ export const loadSecrets = async (
     );
     if (!login.success)
       throw new SecretsProviderError('Vault AppRole response did not contain a client token');
-    token = login.data.auth.client_token;
-  }
+    return login.data.auth.client_token;
+  };
+  let token =
+    session?.token ??
+    (settings.VAULT_AUTH_METHOD === 'approle' ? await login() : settings.VAULT_TOKEN);
   if (!token) throw new SecretsProviderError('Vault authentication did not produce a token');
-  const secret = kvResponse.safeParse(
-    await jsonRequest(settings.VAULT_SECRET_PATH, {
-      headers: { ...headers, 'X-Vault-Token': token },
-    }),
-  );
+  const read = (accessToken: string): Promise<unknown> =>
+    jsonRequest(settings.VAULT_SECRET_PATH, {
+      headers: { ...headers, 'X-Vault-Token': accessToken },
+    });
+  let response: unknown;
+  try {
+    response = await read(token);
+  } catch (error: unknown) {
+    if (
+      !(error instanceof SecretsProviderError) ||
+      error.status !== 403 ||
+      settings.VAULT_AUTH_METHOD !== 'approle'
+    ) {
+      throw error;
+    }
+    token = await login();
+    response = await read(token);
+  }
+  const secret = kvResponse.safeParse(response);
   if (!secret.success) throw new SecretsProviderError('Vault response is not a KV v2 secret');
   const loaded: Record<string, string> = {};
   for (const [key, value] of Object.entries(secret.data.data.data)) {
@@ -164,5 +265,33 @@ export const loadSecrets = async (
   if (Object.keys(loaded).length === 0)
     throw new SecretsProviderError('Vault secret contains no supported sensitive keys');
   Object.assign(source, loaded);
+  if (session) {
+    session.token = token;
+    session.start(async () => {
+      if (!session.token)
+        throw new SecretsProviderError('Vault authentication did not produce a token');
+      try {
+        const renewed = renewResponse.safeParse(
+          await jsonRequest('auth/token/renew-self', {
+            method: 'POST',
+            headers: { ...headers, 'X-Vault-Token': session.token },
+          }),
+        );
+        if (!renewed.success) throw new SecretsProviderError('Invalid Vault renewal response');
+        session.token = renewed.data.auth.client_token ?? session.token;
+        return 'renew';
+      } catch (error: unknown) {
+        if (
+          !(error instanceof SecretsProviderError) ||
+          (error.status !== 403 && error.status !== 400) ||
+          settings.VAULT_AUTH_METHOD !== 'approle'
+        ) {
+          throw error;
+        }
+        session.token = await login();
+        return 'reauthenticate';
+      }
+    }, settings.VAULT_TOKEN_RENEW_INTERVAL_MS);
+  }
   return { provider: 'vault', keys: Object.keys(loaded) };
 };

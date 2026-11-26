@@ -3,14 +3,16 @@ import type { AddressInfo } from 'node:net';
 import { mkdtemp, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { loadSecrets } from '../src/config/secrets.js';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createSecretsProvider, loadSecrets } from '../src/config/secrets.js';
 
 let server: Server;
 let address: string;
 let payload: unknown;
 let status = 200;
 let hold = false;
+let deniedReads = 0;
+let renewStatus = 200;
 let login: unknown;
 let calls: { path?: string; token?: string; namespace?: string; body: string }[];
 const token = 'test-vault-token';
@@ -35,6 +37,17 @@ beforeAll(async () => {
       res.end(JSON.stringify(login));
       return;
     }
+    if (req.url?.endsWith('/renew-self')) {
+      res.statusCode = renewStatus;
+      res.end(JSON.stringify({ auth: { client_token: token } }));
+      return;
+    }
+    if (deniedReads > 0) {
+      deniedReads -= 1;
+      res.statusCode = 403;
+      res.end(JSON.stringify({ errors: ['private response'] }));
+      return;
+    }
     res.statusCode = req.headers['x-vault-token'] === token ? status : 403;
     res.end(JSON.stringify(payload));
   });
@@ -45,6 +58,8 @@ beforeEach(() => {
   calls = [];
   status = 200;
   hold = false;
+  deniedReads = 0;
+  renewStatus = 200;
   login = { auth: { client_token: token } };
   payload = {
     data: {
@@ -132,6 +147,93 @@ describe('Vault/OpenBao KV v2 secret loading', () => {
     });
     expect(calls[1]).toMatchObject({ token, namespace: 'enterprise/team' });
     expect(env.VAULT_TOKEN).toBe('');
+  });
+
+  it('re-authenticates once when an AppRole token is rejected during a read', async () => {
+    deniedReads = 1;
+    const env = environment({
+      VAULT_AUTH_METHOD: 'approle',
+      VAULT_ROLE_ID: 'role',
+      VAULT_SECRET_ID: 'secret',
+    });
+    await loadSecrets(env);
+    expect(calls.map((call) => call.path)).toEqual([
+      '/v1/auth/approle/login',
+      '/v1/secret/data/task-queue',
+      '/v1/auth/approle/login',
+      '/v1/secret/data/task-queue',
+    ]);
+    expect(env.ADMIN_PASSWORD).toBe('from-vault-password');
+    deniedReads = 2;
+    calls = [];
+    await expect(loadSecrets(env)).rejects.toThrow('HTTP 403');
+    expect(calls).toHaveLength(4);
+  });
+
+  it('renews periodically and re-authenticates an AppRole after a rejected renewal', async () => {
+    const events = vi.fn();
+    const provider = createSecretsProvider(events);
+    try {
+      await provider.load(
+        environment({
+          VAULT_AUTH_METHOD: 'approle',
+          VAULT_ROLE_ID: 'role',
+          VAULT_SECRET_ID: 'secret',
+          VAULT_TOKEN_RENEW_INTERVAL_MS: '1000',
+        }),
+      );
+      await vi.waitFor(
+        () => {
+          expect(events).toHaveBeenCalledWith({ action: 'renew', outcome: 'success' });
+        },
+        {
+          timeout: 3000,
+        },
+      );
+      renewStatus = 403;
+      await vi.waitFor(
+        () => {
+          expect(events).toHaveBeenCalledWith({ action: 'reauthenticate', outcome: 'success' });
+        },
+        { timeout: 3000 },
+      );
+      expect(calls.filter((call) => call.path?.endsWith('/login'))).toHaveLength(2);
+      expect(JSON.stringify(events.mock.calls)).not.toContain('secret');
+    } finally {
+      await provider.close();
+    }
+  });
+
+  it('retries failed token renewal without logging credentials', async () => {
+    const events = vi.fn();
+    const provider = createSecretsProvider(events);
+    renewStatus = 503;
+    try {
+      await provider.load(environment({ VAULT_TOKEN_RENEW_INTERVAL_MS: '1000' }));
+      await vi.waitFor(
+        () => {
+          expect(events).toHaveBeenCalledWith({ action: 'renew', outcome: 'failure' });
+        },
+        {
+          timeout: 3000,
+        },
+      );
+      renewStatus = 200;
+      await vi.waitFor(
+        () => {
+          expect(events).toHaveBeenCalledWith({ action: 'renew', outcome: 'success' });
+        },
+        {
+          timeout: 3000,
+        },
+      );
+      expect(
+        calls.filter((call) => call.path?.endsWith('/renew-self')).map((call) => call.token),
+      ).toEqual([token, token]);
+      expect(JSON.stringify(events.mock.calls)).not.toContain(token);
+    } finally {
+      await provider.close();
+    }
   });
 
   it('fails before reading or changing secrets when configuration is missing or unsafe', async () => {
